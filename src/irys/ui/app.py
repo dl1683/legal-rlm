@@ -1,0 +1,276 @@
+"""Simple Gradio UI for testing RLM capabilities.
+
+Features:
+- Directory picker
+- Query input
+- REAL-TIME thinking display (streams as investigation progresses)
+- Citations panel
+- Thinking trace panel
+"""
+
+import gradio as gr
+import asyncio
+import threading
+import queue
+import time
+from pathlib import Path
+from typing import Optional, Generator
+import os
+
+from ..core.models import GeminiClient
+from ..rlm.engine import RLMEngine, RLMConfig
+from ..rlm.state import InvestigationState, ThinkingStep, Citation, StepType
+
+
+class RLMApp:
+    """Gradio application wrapper for RLM with real-time streaming."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self.current_state: Optional[InvestigationState] = None
+        self.thinking_log: list[str] = []
+        self.citations_log: list[str] = []
+        self.update_queue: queue.Queue = queue.Queue()
+        self.is_running = False
+        self.final_output = ""
+        self.error_msg = ""
+
+    def on_thinking_step(self, step: ThinkingStep):
+        """Callback for thinking steps - pushes to queue for real-time updates."""
+        self.thinking_log.append(step.display)
+        self.update_queue.put(("thinking", step.display))
+
+    def on_citation(self, citation: Citation):
+        """Callback for citations."""
+        page_str = f", p. {citation.page}" if citation.page else ""
+        citation_text = f"[{len(self.citations_log) + 1}] {citation.document}{page_str}"
+        self.citations_log.append(citation_text)
+        self.update_queue.put(("citation", citation_text))
+
+    def run_investigation_async(self, query: str, repo_path: str):
+        """Run investigation in background thread."""
+        async def _run():
+            try:
+                client = GeminiClient(api_key=self.api_key)
+                engine = RLMEngine(
+                    gemini_client=client,
+                    config=RLMConfig(),
+                    on_step=self.on_thinking_step,
+                    on_citation=self.on_citation,
+                )
+                state = await engine.investigate(query, repo_path)
+                self.current_state = state
+                self.final_output = state.findings.get("final_output", "No output generated")
+                self.update_queue.put(("complete", state))
+            except Exception as e:
+                self.error_msg = str(e)
+                self.update_queue.put(("error", str(e)))
+
+        asyncio.run(_run())
+
+    def stream_investigation(
+        self,
+        query: str,
+        repo_path: str,
+    ) -> Generator[tuple, None, None]:
+        """
+        Generator that streams investigation updates in real-time.
+        Yields: (output, thinking_trace, citations, status)
+        """
+        self.thinking_log = []
+        self.citations_log = []
+        self.final_output = ""
+        self.error_msg = ""
+        self.update_queue = queue.Queue()
+
+        if not repo_path or not Path(repo_path).exists():
+            yield ("", "", "", "Error: Please select a valid directory")
+            return
+
+        if not query.strip():
+            yield ("", "", "", "Error: Please enter a query")
+            return
+
+        # Start investigation in background thread
+        self.is_running = True
+        thread = threading.Thread(
+            target=self.run_investigation_async,
+            args=(query, repo_path)
+        )
+        thread.start()
+
+        start_time = time.time()
+
+        # Stream updates as they come in
+        while self.is_running:
+            try:
+                update_type, data = self.update_queue.get(timeout=0.5)
+
+                if update_type == "thinking":
+                    elapsed = time.time() - start_time
+                    status = (
+                        f"Status: INVESTIGATING...\n"
+                        f"Elapsed: {elapsed:.1f}s\n"
+                        f"Steps: {len(self.thinking_log)}\n"
+                        f"Citations: {len(self.citations_log)}"
+                    )
+                    yield (
+                        "*Investigation in progress...*",
+                        "\n".join(self.thinking_log),
+                        "\n".join(self.citations_log) or "Finding sources...",
+                        status
+                    )
+
+                elif update_type == "citation":
+                    # Just update citations
+                    pass
+
+                elif update_type == "complete":
+                    self.is_running = False
+                    state = data
+                    elapsed = time.time() - start_time
+                    status = (
+                        f"Status: COMPLETE\n"
+                        f"Documents read: {state.documents_read}\n"
+                        f"Searches performed: {state.searches_performed}\n"
+                        f"Citations found: {len(state.citations)}\n"
+                        f"Duration: {elapsed:.1f}s"
+                    )
+                    yield (
+                        self.final_output,
+                        "\n".join(self.thinking_log),
+                        "\n".join(self.citations_log) or "No citations found",
+                        status
+                    )
+                    return
+
+                elif update_type == "error":
+                    self.is_running = False
+                    yield (
+                        "",
+                        "\n".join(self.thinking_log),
+                        "",
+                        f"Error: {data}"
+                    )
+                    return
+
+            except queue.Empty:
+                # No update, yield current state to keep UI responsive
+                elapsed = time.time() - start_time
+                if len(self.thinking_log) > 0:
+                    status = (
+                        f"Status: INVESTIGATING...\n"
+                        f"Elapsed: {elapsed:.1f}s\n"
+                        f"Steps: {len(self.thinking_log)}\n"
+                        f"Citations: {len(self.citations_log)}"
+                    )
+                    yield (
+                        "*Investigation in progress...*",
+                        "\n".join(self.thinking_log),
+                        "\n".join(self.citations_log) or "Finding sources...",
+                        status
+                    )
+
+        # Final yield after thread completes
+        thread.join()
+
+
+def create_app(api_key: Optional[str] = None) -> gr.Blocks:
+    """Create the Gradio application with real-time streaming."""
+    app = RLMApp(api_key=api_key)
+
+    with gr.Blocks(
+        title="Irys RLM - Legal Document Analysis",
+    ) as demo:
+        gr.Markdown("# Irys RLM - Recursive Legal Document Analysis")
+        gr.Markdown(
+            "Select a matter repository and ask a legal question. "
+            "**Watch the thinking trace update in real-time as the system investigates!**"
+        )
+
+        with gr.Row():
+            with gr.Column(scale=2):
+                repo_path = gr.Textbox(
+                    label="Repository Path",
+                    placeholder="Enter path to matter repository...",
+                    info="Full path to the folder containing legal documents",
+                    value=r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
+                )
+                query = gr.Textbox(
+                    label="Legal Query",
+                    placeholder="What would you like to investigate?",
+                    lines=3,
+                )
+                submit_btn = gr.Button("Investigate", variant="primary", size="lg")
+
+            with gr.Column(scale=1):
+                status = gr.Textbox(label="Status", lines=8, interactive=False)
+
+        with gr.Tabs():
+            with gr.TabItem("Thinking Trace (LIVE)"):
+                thinking = gr.Textbox(
+                    label="Thinking Steps - Updates in real-time!",
+                    lines=30,
+                    interactive=False,
+                    autoscroll=True,
+                )
+
+            with gr.TabItem("Analysis Output"):
+                output = gr.Markdown(label="Analysis")
+
+            with gr.TabItem("Citations"):
+                citations = gr.Textbox(
+                    label="Citations & Sources",
+                    lines=25,
+                    interactive=False,
+                )
+
+        # Wire up the submit button with streaming
+        submit_btn.click(
+            fn=app.stream_investigation,
+            inputs=[query, repo_path],
+            outputs=[output, thinking, citations, status],
+        )
+
+        # Example queries
+        gr.Examples(
+            examples=[
+                [
+                    "What are the key claims in this dispute?",
+                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
+                ],
+                [
+                    "What was the initial cost estimate vs actual cost?",
+                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
+                ],
+                [
+                    "What damages are being claimed and what is the basis?",
+                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
+                ],
+            ],
+            inputs=[query, repo_path],
+        )
+
+    return demo
+
+
+def main():
+    """Run the application."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Irys RLM UI")
+    parser.add_argument("--api-key", help="Gemini API key")
+    parser.add_argument("--port", type=int, default=7860, help="Port to run on")
+    parser.add_argument("--share", action="store_true", help="Create public link")
+    args = parser.parse_args()
+
+    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Warning: No GEMINI_API_KEY provided")
+
+    app = create_app(api_key=api_key)
+    app.launch(server_port=args.port, share=args.share)
+
+
+if __name__ == "__main__":
+    main()
