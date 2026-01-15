@@ -83,11 +83,11 @@ Search Results for "{search_term}":
 
 ANALYZE THESE RESULTS CAREFULLY:
 
-1. KEY FACTS (up to 15 most important): Extract specific, citable facts that are:
+1. KEY FACTS: Extract ONLY the 10 most important specific facts (STRICT LIMIT: 10 maximum):
    - Directly relevant to the query
    - Supported by the document text
    - Include dates, amounts, party names where found
-   - Prioritize unique, non-redundant facts
+   - Keep each fact under 100 characters
 
 2. NEW LEADS: Identify specific avenues to investigate:
    - Referenced documents that should be examined
@@ -105,22 +105,12 @@ ANALYZE THESE RESULTS CAREFULLY:
    - Fill gaps in the evidence
    - Find contradictory evidence (for completeness)
 
-Respond in JSON format:
+Respond in COMPACT JSON (keep under 3000 chars):
 {{
-    "key_facts": [
-        {{"fact": "...", "source": "filename", "confidence": "high/medium/low"}}
-    ],
-    "new_leads": [
-        {{"description": "...", "priority": 0.0-1.0, "reason": "...", "lead_type": "document/person/event/verification"}}
-    ],
-    "hypothesis_evaluation": {{
-        "supports": true/false,
-        "confidence_change": "increased/decreased/unchanged",
-        "reasoning": "..."
-    }},
-    "hypothesis_update": "Updated hypothesis or null if unchanged",
-    "next_searches": ["term1", "term2", ...],
-    "evidence_gaps": ["gap1", "gap2", ...]
+    "key_facts": ["fact 1", "fact 2", ...],
+    "new_leads": [{{"desc": "...", "priority": 0.8}}],
+    "hypothesis_update": "string or null",
+    "next_searches": ["term1", "term2"]
 }}
 """
 
@@ -135,15 +125,14 @@ Content:
 Query Context: {query}
 Current Investigation Focus: {focus}
 
-CONDUCT A THOROUGH LEGAL ANALYSIS (keep response concise to avoid truncation):
+CONDUCT A FOCUSED LEGAL ANALYSIS. IMPORTANT: Keep response under 4000 characters total.
 
-1. KEY FACTS (up to 20 most important): Extract facts that are:
+1. KEY FACTS (STRICT LIMIT: 15 maximum facts): Extract facts that are:
    - Directly relevant to the query/focus
    - Specific (include dates, amounts, names)
-   - Verifiable from the document text
-   - Non-redundant
+   - Keep each fact under 100 characters
 
-2. CRITICAL QUOTES (up to 5 most important): Identify the most important passages:
+2. CRITICAL QUOTES (STRICT LIMIT: 3 maximum): Identify the most important passages:
    - Direct admissions or acknowledgments
    - Terms that define obligations or rights
    - Statements of fact that support/contradict claims
@@ -166,26 +155,13 @@ CONDUCT A THOROUGH LEGAL ANALYSIS (keep response concise to avoid truncation):
    - Contradictions within the document
    - Issues requiring legal interpretation
 
-Respond in JSON format:
+Respond in COMPACT JSON (STRICT: under 4000 chars total):
 {{
-    "key_facts": [
-        {{"fact": "...", "page": N, "significance": "..."}}
-    ],
-    "quotes": [
-        {{"text": "exact quote", "page": N, "relevance": "why this matters", "category": "admission/term/factual/obligation"}}
-    ],
-    "entities": {{
-        "people": [{{"name": "...", "role": "...", "significance": "..."}}],
-        "companies": [{{"name": "...", "relationship": "..."}}],
-        "dates": [{{"date": "...", "event": "...", "significance": "..."}}],
-        "amounts": [{{"value": "...", "context": "...", "page": N}}]
-    }},
-    "connections": [
-        {{"reference": "...", "type": "document/event/prior_agreement", "need_to_find": true/false}}
-    ],
-    "concerns": [
-        {{"issue": "...", "severity": "high/medium/low", "reason": "..."}}
-    ]
+    "key_facts": [{{"fact": "...", "page": N}}],
+    "quotes": [{{"text": "...", "page": N}}],
+    "entities": {{"people": ["name1"], "dates": ["date1"], "amounts": ["$X"]}},
+    "connections": ["doc reference 1"],
+    "concerns": ["issue 1"]
 }}
 """
 
@@ -878,14 +854,16 @@ class RLMEngine:
             if self.on_citation:
                 self.on_citation(citation)
 
-        # Add new leads
+        # Add new leads (handle both "description" and compact "desc" formats)
         for lead_data in analysis.get("new_leads", [])[:3]:
-            if isinstance(lead_data, dict) and "description" in lead_data:
-                state.add_lead(
-                    description=lead_data["description"],
-                    source=f"Analysis of '{results.query}'",
-                    priority=lead_data.get("priority", 0.5),
-                )
+            if isinstance(lead_data, dict):
+                desc = lead_data.get("description") or lead_data.get("desc")
+                if desc:
+                    state.add_lead(
+                        description=desc,
+                        source=f"Analysis of '{results.query}'",
+                        priority=lead_data.get("priority", 0.5),
+                    )
 
         # Deep read top documents in parallel
         top_files = list(results.by_file().keys())[:self.config.parallel_reads]
