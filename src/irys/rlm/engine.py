@@ -83,10 +83,11 @@ Search Results for "{search_term}":
 
 ANALYZE THESE RESULTS CAREFULLY:
 
-1. KEY FACTS: Extract specific, citable facts that are:
+1. KEY FACTS (up to 15 most important): Extract specific, citable facts that are:
    - Directly relevant to the query
    - Supported by the document text
    - Include dates, amounts, party names where found
+   - Prioritize unique, non-redundant facts
 
 2. NEW LEADS: Identify specific avenues to investigate:
    - Referenced documents that should be examined
@@ -134,14 +135,15 @@ Content:
 Query Context: {query}
 Current Investigation Focus: {focus}
 
-CONDUCT A THOROUGH LEGAL ANALYSIS:
+CONDUCT A THOROUGH LEGAL ANALYSIS (keep response concise to avoid truncation):
 
-1. KEY FACTS: Extract facts that are:
+1. KEY FACTS (up to 20 most important): Extract facts that are:
    - Directly relevant to the query/focus
    - Specific (include dates, amounts, names)
    - Verifiable from the document text
+   - Non-redundant
 
-2. CRITICAL QUOTES: Identify the most important passages:
+2. CRITICAL QUOTES (up to 5 most important): Identify the most important passages:
    - Direct admissions or acknowledgments
    - Terms that define obligations or rights
    - Statements of fact that support/contradict claims

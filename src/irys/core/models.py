@@ -42,21 +42,21 @@ MODEL_CONFIGS: dict[ModelTier, ModelConfig] = {
     ModelTier.LITE: ModelConfig(
         model_id="gemini-2.5-flash-lite",
         thinking_level="",
-        max_output_tokens=4096,
+        max_output_tokens=8192,  # Increased from 4096 to reduce truncation
         cost_per_1m_input=0.01875,  # 1/4 of flash
         cost_per_1m_output=0.075,
     ),
     ModelTier.FLASH: ModelConfig(
         model_id="gemini-2.5-flash",
         thinking_level="",
-        max_output_tokens=8192,
+        max_output_tokens=16384,  # Increased from 8192 to reduce JSON truncation
         cost_per_1m_input=0.075,
         cost_per_1m_output=0.30,
     ),
     ModelTier.PRO: ModelConfig(
         model_id="gemini-2.5-pro",
         thinking_level="",
-        max_output_tokens=16384,
+        max_output_tokens=32768,  # Increased from 16384 for thorough analysis
         cost_per_1m_input=1.25,
         cost_per_1m_output=5.00,
     ),
