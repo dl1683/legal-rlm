@@ -89,7 +89,8 @@ class Irys:
             self._client = GeminiClient(api_key=self.config.api_key)
 
         if self._cache is None and self.config.cache_enabled:
-            self._cache = ResponseCache(ttl_seconds=self.config.cache_ttl_seconds)
+            self._cache = ResponseCache(
+                ttl_seconds=self.config.cache_ttl_seconds)
 
         if self._engine is None:
             engine_config = RLMConfig(
@@ -190,7 +191,8 @@ class Irys:
         self._ensure_initialized()
 
         file_paths = [Path(f) for f in files]
-        repo = MatterRepository(repository or file_paths[0].parent) if repository or file_paths else None
+        repo = MatterRepository(
+            repository or file_paths[0].parent) if repository or file_paths else None
 
         return await self._engine.summarize_documents(file_paths, repo)
 
@@ -212,7 +214,7 @@ class Irys:
             List of search hits
         """
         repo = MatterRepository(repository)
-        files = list(repo.list_documents())
+        files = list(repo.list_files())
         results = repo.search(query, regex=regex)
 
         return [
@@ -328,7 +330,8 @@ async def batch_investigate(
                 result = await irys.investigate(query, repository)
                 results.append(result)
             except Exception as e:
-                logger.error(f"Investigation failed for query '{query[:50]}...': {e}")
+                logger.error(
+                    f"Investigation failed for query '{query[:50]}...': {e}")
         return results
 
 
