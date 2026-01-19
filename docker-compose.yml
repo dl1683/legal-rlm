@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+  irys-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: irys-rlm
+    ports:
+      - "8000:8000"
+    environment:
+      # Required
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION:-us-east-1}
+
+      # AWS Credentials (use IAM role on EC2 instead if possible)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+
+      # Optional configuration
+      - IRYS_HOST=0.0.0.0
+      - IRYS_PORT=8000
+      - IRYS_WORKERS=1
+      - IRYS_DEBUG=${IRYS_DEBUG:-false}
+      - IRYS_LOG_LEVEL=${IRYS_LOG_LEVEL:-INFO}
+      - IRYS_LOG_FORMAT=json
+
+      # Resource limits (important for small instances)
+      - IRYS_MAX_CONCURRENT_JOBS=3
+      - IRYS_MAX_DOCS_PER_JOB=50
+      - IRYS_MAX_DOC_SIZE_MB=10
+      - IRYS_MAX_TEMP_SIZE_MB=500
+      - IRYS_CLEANUP_SECONDS=300
+
+    volumes:
+      # Use a named volume for temp files (persists across restarts)
+      - irys-temp:/tmp/irys
+
+    # Resource limits for small instances
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # Logging
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  irys-temp:
+    driver: local
+

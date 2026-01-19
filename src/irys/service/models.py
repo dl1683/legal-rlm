@@ -1,0 +1,115 @@
+"""Pydantic models for API request/response schemas."""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Optional
+from pydantic import BaseModel, Field
+
+
+class JobStatus(str, Enum):
+    """Investigation job status."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class InvestigateRequest(BaseModel):
+    """Request to start an investigation."""
+    query: str = Field(..., description="Investigation query")
+    s3_prefix: str = Field(..., description="S3 prefix containing documents")
+    callback_url: Optional[str] = Field(
+        None, description="URL to POST results when complete"
+    )
+    options: Optional[dict[str, Any]] = Field(
+        default_factory=dict, description="Additional investigation options"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "What are the key payment terms and obligations?",
+                "s3_prefix": "documents/contracts/acme-deal",
+                "callback_url": "https://your-service.com/webhook/investigation",
+            }
+        }
+
+
+class InvestigateResponse(BaseModel):
+    """Response from starting an investigation."""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Current job status")
+    message: str = Field(..., description="Status message")
+    estimated_seconds: Optional[int] = Field(
+        None, description="Estimated completion time"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "job_id": "inv_abc123",
+                "status": "pending",
+                "message": "Investigation queued",
+                "estimated_seconds": 60,
+            }
+        }
+
+
+class JobResult(BaseModel):
+    """Complete investigation result."""
+    job_id: str
+    status: JobStatus
+    query: str
+    s3_prefix: str
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+
+    # Results (only when completed)
+    analysis: Optional[str] = None
+    citations: Optional[list[dict[str, Any]]] = None
+    entities: Optional[dict[str, list[str]]] = None
+    documents_processed: int = 0
+    error: Optional[str] = None
+
+
+class SearchRequest(BaseModel):
+    """Request for quick search."""
+    query: str = Field(..., description="Search query")
+    s3_prefix: str = Field(..., description="S3 prefix containing documents")
+    max_results: int = Field(20, ge=1, le=100, description="Maximum results")
+
+
+class SearchResult(BaseModel):
+    """Single search result."""
+    file: str
+    page: Optional[int] = None
+    text: str
+    context: Optional[str] = None
+    score: Optional[float] = None
+
+
+class SearchResponse(BaseModel):
+    """Search response."""
+    results: list[SearchResult]
+    total_matches: int
+    documents_searched: int
+
+
+class HealthResponse(BaseModel):
+    """Health check response."""
+    status: str = "healthy"
+    version: str
+    gemini_connected: bool
+    s3_connected: bool
+    active_jobs: int
+    temp_storage_mb: float
+    uptime_seconds: float
+
+
+class ErrorResponse(BaseModel):
+    """Error response."""
+    error: str
+    detail: Optional[str] = None
+    code: Optional[str] = None
+
