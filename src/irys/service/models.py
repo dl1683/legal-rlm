@@ -143,6 +143,7 @@ class SyncInvestigateResponse(BaseModel):
     entities: dict[str, list[str]] = {}
     documents_processed: int
     duration_seconds: float
+    s3_prefix: Optional[str] = Field(None, description="S3 prefix if files were kept")
 
 
 # === S3 URL Models ===

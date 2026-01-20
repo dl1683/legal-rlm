@@ -277,3 +277,67 @@ class S3Repository:
 
         return await asyncio.to_thread(_download)
 
+    async def upload_files(
+        self,
+        job_id: str,
+        files: list[tuple[str, bytes]],
+        prefix: str = "uploads",
+    ) -> str:
+        """Upload files to S3.
+
+        Args:
+            job_id: Unique job identifier
+            files: List of (filename, content) tuples
+            prefix: S3 prefix for uploads (default: "uploads")
+
+        Returns:
+            S3 prefix where files were uploaded
+        """
+        upload_prefix = f"{prefix}/{job_id}"
+
+        def _upload():
+            uploaded = 0
+            for filename, content in files:
+                key = f"{upload_prefix}/{filename}"
+                self._s3.put_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Body=content,
+                )
+                uploaded += 1
+                logger.debug(f"Uploaded {filename} to s3://{self.bucket}/{key}")
+            return uploaded
+
+        count = await asyncio.to_thread(_upload)
+        logger.info(f"Uploaded {count} files to s3://{self.bucket}/{upload_prefix}/")
+        return upload_prefix
+
+    async def delete_prefix(self, prefix: str) -> int:
+        """Delete all objects under a prefix.
+
+        Args:
+            prefix: S3 prefix to delete
+
+        Returns:
+            Number of objects deleted
+        """
+        def _delete():
+            deleted = 0
+            paginator = self._s3.get_paginator("list_objects_v2")
+
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                objects = page.get("Contents", [])
+                if objects:
+                    delete_keys = [{"Key": obj["Key"]} for obj in objects]
+                    self._s3.delete_objects(
+                        Bucket=self.bucket,
+                        Delete={"Objects": delete_keys},
+                    )
+                    deleted += len(delete_keys)
+
+            return deleted
+
+        count = await asyncio.to_thread(_delete)
+        logger.info(f"Deleted {count} objects from s3://{self.bucket}/{prefix}")
+        return count
+

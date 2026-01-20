@@ -59,7 +59,27 @@ IRYS_MAX_DOCS_PER_JOB=50
 
 # Temp storage limit in MB (default: 500)
 IRYS_MAX_TEMP_SIZE_MB=500
+
+# ============================================
+# OPTIONAL - Storage Mode
+# ============================================
+
+# Storage mode for file uploads:
+# - "local": Files stored on VM disk (for development/testing)
+# - "s3": Files streamed to S3 (for production, keeps VM light)
+IRYS_STORAGE_MODE=local  # Use "s3" for production
 ```
+
+### Local Development (No S3 Required)
+
+For local development, you only need:
+
+```env
+GEMINI_API_KEY=your_api_key
+IRYS_STORAGE_MODE=local
+```
+
+This stores uploaded files on disk instead of S3, perfect for testing.
 
 ### S3 Bucket Structure
 
@@ -714,6 +734,62 @@ curl -X POST http://localhost:8000/upload/search \
   -F "max_results=10"
 ```
 
+### Upload & Investigate (Sync)
+
+Upload and investigate files synchronously - returns results directly without polling.
+
+```
+POST /upload/investigate/sync
+Content-Type: multipart/form-data
+```
+
+**Form Fields:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | ✅ | Investigation question |
+| `files` | file[] | ✅ | Document files (PDF, DOCX, TXT) |
+| `keep_files` | bool | ❌ | Keep files in S3 for re-query (default: false) |
+
+**Response:**
+```json
+{
+  "query": "What are the payment terms?",
+  "analysis": "Based on the documents, the payment terms are...",
+  "citations": [
+    {
+      "id": "abc123",
+      "document": "contract.pdf",
+      "page": 12,
+      "text": "Payment shall be due within 30 days...",
+      "relevance": "Directly addresses payment terms"
+    }
+  ],
+  "entities": {
+    "ACME Corp": {"name": "ACME Corp", "entity_type": "company", "mentions": 5},
+    "John Smith": {"name": "John Smith", "entity_type": "person", "mentions": 3}
+  },
+  "documents_processed": 2,
+  "duration_seconds": 45.2,
+  "s3_prefix": "uploads/sync_abc123"  // Only if keep_files=true
+}
+```
+
+**cURL Example:**
+```bash
+# Basic - process and delete files
+curl -X POST http://localhost:8000/upload/investigate/sync \
+  -F "query=What are the payment terms?" \
+  -F "files=@contract.pdf"
+
+# Keep files in S3 for later re-query
+curl -X POST http://localhost:8000/upload/investigate/sync \
+  -F "query=What are the payment terms?" \
+  -F "files=@contract.pdf" \
+  -F "keep_files=true"
+```
+
+**Note:** This endpoint blocks until complete (30-120 seconds depending on document size).
+
 ---
 
 ## S3 URL Endpoints
@@ -807,6 +883,54 @@ curl -X POST http://localhost:8000/search/urls \
   }'
 ```
 
+### Investigate by URLs (Sync)
+
+Investigate documents from S3 URLs synchronously - returns results directly.
+**Best for chat applications that need immediate responses.**
+
+```
+POST /investigate/urls/sync
+Content-Type: application/json
+```
+
+**Request Body:**
+```json
+{
+  "query": "What are the key terms?",
+  "s3_urls": [
+    "s3://my-bucket/contracts/main.pdf",
+    "s3://my-bucket/contracts/amendment.pdf"
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "query": "What are the key terms?",
+  "analysis": "Based on the documents...",
+  "citations": [...],
+  "entities": {...},
+  "documents_processed": 2,
+  "duration_seconds": 52.3
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/investigate/urls/sync \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What are the payment obligations?",
+    "s3_urls": [
+      "s3://my-bucket/docs/contract.pdf",
+      "s3://my-bucket/docs/addendum.pdf"
+    ]
+  }'
+```
+
+**Note:** This endpoint blocks until complete (30-120 seconds). Use for chat integrations where you need immediate results.
+
 ---
 
 ## Error Handling
@@ -869,8 +993,17 @@ async def investigate_with_retry(client, query, s3_prefix):
 
 ## Quick Start Checklist
 
+### For Local Development
+- [ ] Set `GEMINI_API_KEY` in `.env`
+- [ ] Set `IRYS_STORAGE_MODE=local` in `.env`
+- [ ] Start server: `python run_server.py`
+- [ ] Test health: `curl http://localhost:8000/health`
+- [ ] Test with file upload: `curl -X POST http://localhost:8000/upload/investigate/sync -F "query=test" -F "files=@doc.pdf"`
+
+### For Production
 - [ ] Set `GEMINI_API_KEY` in `.env`
 - [ ] Set `S3_BUCKET` in `.env`
+- [ ] Set `IRYS_STORAGE_MODE=s3` in `.env`
 - [ ] Configure AWS credentials (env vars or IAM role)
 - [ ] Upload documents to S3 bucket
 - [ ] Start server: `python run_server.py`
@@ -878,5 +1011,4 @@ async def investigate_with_retry(client, query, s3_prefix):
 - [ ] Run first investigation
 - [ ] Set up webhook endpoint (optional)
 - [ ] Deploy to EC2 (see DEPLOY.md)
-```
 
