@@ -117,3 +117,12 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+# Deployment configs (server-specific)
+nginx-*.conf
+!nginx.conf.example
+*.service
+docker-compose.override.yml
+
+# Virtual environment
+.venv/
+
