@@ -10,7 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
+import aiofiles
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
@@ -25,6 +26,10 @@ from .models import (
     SearchResult,
     HealthResponse,
     ErrorResponse,
+    UploadInvestigateResponse,
+    UploadSearchResponse,
+    S3UrlsInvestigateRequest,
+    S3UrlsSearchRequest,
 )
 from .s3_repository import S3Repository
 
@@ -358,4 +363,386 @@ async def quick_search(request: SearchRequest):
 
     except Exception as e:
         logger.error(f"Search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === FILE UPLOAD ENDPOINTS ===
+
+
+async def _save_uploaded_files(
+    files: list[UploadFile],
+    temp_dir: Path,
+) -> int:
+    """Save uploaded files to temp directory. Returns count saved."""
+    saved = 0
+    for file in files:
+        if not file.filename:
+            continue
+        # Sanitize filename
+        filename = Path(file.filename).name
+        dest_path = temp_dir / filename
+        async with aiofiles.open(dest_path, "wb") as f:
+            content = await file.read()
+            await f.write(content)
+        saved += 1
+    return saved
+
+
+@app.post(
+    "/upload/investigate",
+    response_model=UploadInvestigateResponse,
+    tags=["File Upload"],
+    responses={400: {"model": ErrorResponse}},
+)
+async def upload_investigate(
+    query: str = Form(..., description="Investigation query"),
+    files: list[UploadFile] = File(..., description="Document files to analyze"),
+    callback_url: Optional[str] = Form(None, description="Webhook URL for results"),
+    background_tasks: BackgroundTasks = None,
+):
+    """Start investigation with uploaded files.
+
+    Upload documents directly and run an investigation query against them.
+    Supports PDF, DOCX, and TXT files.
+    """
+    config = get_config()
+
+    # Check concurrent job limit
+    active_count = sum(
+        1 for job in _jobs.values()
+        if job.status in (JobStatus.PENDING, JobStatus.PROCESSING)
+    )
+    if active_count >= config.max_concurrent_jobs:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many concurrent jobs. Max: {config.max_concurrent_jobs}",
+        )
+
+    # Check file count
+    if len(files) > config.max_documents_per_job:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many files ({len(files)}). Max: {config.max_documents_per_job}",
+        )
+
+    # Generate job ID and create temp directory
+    job_id = f"upload_{uuid.uuid4().hex[:12]}"
+    temp_dir = Path(config.temp_dir) / job_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Save uploaded files
+        saved_count = await _save_uploaded_files(files, temp_dir)
+
+        if saved_count == 0:
+            raise HTTPException(status_code=400, detail="No valid files uploaded")
+
+        # Create job record
+        job = JobResult(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            query=query,
+            s3_prefix=f"upload:{job_id}",
+            created_at=datetime.now(),
+        )
+        _jobs[job_id] = job
+
+        # Start background investigation
+        background_tasks.add_task(
+            _run_upload_investigation,
+            job_id,
+            query,
+            temp_dir,
+            callback_url,
+            config,
+        )
+
+        return UploadInvestigateResponse(
+            job_id=job_id,
+            status=JobStatus.PENDING,
+            message="Investigation started",
+            files_received=saved_count,
+            estimated_seconds=60,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload investigation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_upload_investigation(
+    job_id: str,
+    query: str,
+    temp_dir: Path,
+    callback_url: Optional[str],
+    config: ServiceConfig,
+):
+    """Background task to run investigation on uploaded files."""
+    job = _jobs[job_id]
+    job.status = JobStatus.PROCESSING
+
+    try:
+        from irys import Irys
+        irys = Irys(api_key=config.gemini_api_key)
+
+        result = await irys.investigate(
+            query=query,
+            repository=str(temp_dir),
+        )
+
+        # Extract results
+        job.analysis = result.get("analysis", "")
+        job.citations = result.get("citations", [])
+        job.entities = result.get("entities", {})
+        job.documents_processed = result.get("documents_read", 0)
+        job.status = JobStatus.COMPLETED
+        job.completed_at = datetime.now()
+        job.duration_seconds = (
+            job.completed_at - job.created_at
+        ).total_seconds()
+
+        logger.info(f"Upload job {job_id} completed in {job.duration_seconds:.1f}s")
+
+        # Call webhook if provided
+        if callback_url:
+            await _send_callback(callback_url, job)
+
+    except Exception as e:
+        logger.error(f"Upload job {job_id} failed: {e}")
+        job.status = JobStatus.FAILED
+        job.error = str(e)
+        job.completed_at = datetime.now()
+
+    finally:
+        # Cleanup temp files after delay (allow result retrieval)
+        await asyncio.sleep(config.cleanup_after_seconds)
+        if temp_dir.exists():
+            import shutil
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up upload temp dir: {temp_dir}")
+
+
+@app.post(
+    "/upload/search",
+    response_model=UploadSearchResponse,
+    tags=["File Upload"],
+)
+async def upload_search(
+    query: str = Form(..., description="Search query"),
+    files: list[UploadFile] = File(..., description="Document files to search"),
+    max_results: int = Form(20, ge=1, le=100, description="Maximum results"),
+):
+    """Quick search across uploaded files.
+
+    Upload documents and run a keyword search against them.
+    Synchronous - returns results immediately.
+    """
+    config = get_config()
+    job_id = f"uploadsearch_{uuid.uuid4().hex[:8]}"
+    temp_dir = Path(config.temp_dir) / job_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Save uploaded files
+        saved_count = await _save_uploaded_files(files, temp_dir)
+
+        if saved_count == 0:
+            raise HTTPException(status_code=400, detail="No valid files uploaded")
+
+        # Run search
+        from irys import quick_search as irys_search
+        results = await irys_search(
+            query=query,
+            repository=str(temp_dir),
+            api_key=config.gemini_api_key,
+        )
+
+        return UploadSearchResponse(
+            results=[SearchResult(**r) for r in results[:max_results]],
+            total_matches=len(results),
+            files_searched=saved_count,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Cleanup temp files
+        if temp_dir.exists():
+            import shutil
+            shutil.rmtree(temp_dir)
+
+
+# === S3 URL ENDPOINTS ===
+
+
+@app.post(
+    "/investigate/urls",
+    response_model=InvestigateResponse,
+    tags=["S3 URLs"],
+    responses={400: {"model": ErrorResponse}},
+)
+async def investigate_urls(
+    request: S3UrlsInvestigateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Start investigation with specific S3 URLs.
+
+    Provide a list of S3 URLs to download and analyze.
+    Supports s3:// and https:// S3 URL formats.
+    """
+    config = get_config()
+
+    # Check concurrent job limit
+    active_count = sum(
+        1 for job in _jobs.values()
+        if job.status in (JobStatus.PENDING, JobStatus.PROCESSING)
+    )
+    if active_count >= config.max_concurrent_jobs:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many concurrent jobs. Max: {config.max_concurrent_jobs}",
+        )
+
+    # Generate job ID
+    job_id = f"urls_{uuid.uuid4().hex[:12]}"
+
+    # Create job record
+    job = JobResult(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        query=request.query,
+        s3_prefix=f"urls:{len(request.s3_urls)} files",
+        created_at=datetime.now(),
+    )
+    _jobs[job_id] = job
+
+    # Start background investigation
+    background_tasks.add_task(
+        _run_urls_investigation,
+        job_id,
+        request,
+        config,
+    )
+
+    return InvestigateResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message=f"Investigation started for {len(request.s3_urls)} files",
+        estimated_seconds=60,
+    )
+
+
+async def _run_urls_investigation(
+    job_id: str,
+    request: S3UrlsInvestigateRequest,
+    config: ServiceConfig,
+):
+    """Background task to run investigation on S3 URLs."""
+    job = _jobs[job_id]
+    job.status = JobStatus.PROCESSING
+    s3_repo = None
+    temp_dir = None
+
+    try:
+        # Create S3 repository (bucket from first URL, or config default)
+        s3_repo = S3Repository(
+            bucket=config.s3_bucket or "placeholder",
+            prefix="",
+            config=config,
+        )
+
+        # Download documents from URLs
+        temp_dir = await s3_repo.download_urls_to_temp(job_id, request.s3_urls)
+
+        # Run investigation
+        from irys import Irys
+        irys = Irys(api_key=config.gemini_api_key)
+
+        result = await irys.investigate(
+            query=request.query,
+            repository=str(temp_dir),
+        )
+
+        # Extract results
+        job.analysis = result.get("analysis", "")
+        job.citations = result.get("citations", [])
+        job.entities = result.get("entities", {})
+        job.documents_processed = result.get("documents_read", 0)
+        job.status = JobStatus.COMPLETED
+        job.completed_at = datetime.now()
+        job.duration_seconds = (
+            job.completed_at - job.created_at
+        ).total_seconds()
+
+        logger.info(f"URLs job {job_id} completed in {job.duration_seconds:.1f}s")
+
+        # Call webhook if provided
+        if request.callback_url:
+            await _send_callback(request.callback_url, job)
+
+    except Exception as e:
+        logger.error(f"URLs job {job_id} failed: {e}")
+        job.status = JobStatus.FAILED
+        job.error = str(e)
+        job.completed_at = datetime.now()
+
+    finally:
+        # Cleanup temp files
+        if s3_repo and temp_dir:
+            await s3_repo.cleanup(job_id)
+
+
+@app.post(
+    "/search/urls",
+    response_model=SearchResponse,
+    tags=["S3 URLs"],
+)
+async def search_urls(request: S3UrlsSearchRequest):
+    """Quick keyword search across documents from S3 URLs.
+
+    Provide a list of S3 URLs to download and search.
+    Synchronous - returns results immediately.
+    """
+    config = get_config()
+    job_id = f"searchurls_{uuid.uuid4().hex[:8]}"
+    s3_repo = None
+
+    try:
+        # Create S3 repository
+        s3_repo = S3Repository(
+            bucket=config.s3_bucket or "placeholder",
+            prefix="",
+            config=config,
+        )
+
+        # Download documents from URLs
+        temp_dir = await s3_repo.download_urls_to_temp(job_id, request.s3_urls)
+
+        # Run search
+        from irys import quick_search as irys_search
+        results = await irys_search(
+            query=request.query,
+            repository=str(temp_dir),
+            api_key=config.gemini_api_key,
+        )
+
+        # Cleanup
+        await s3_repo.cleanup(job_id)
+
+        return SearchResponse(
+            results=[SearchResult(**r) for r in results[:request.max_results]],
+            total_matches=len(results),
+            documents_searched=len(request.s3_urls),
+        )
+
+    except Exception as e:
+        logger.error(f"URL search failed: {e}")
+        if s3_repo:
+            await s3_repo.cleanup(job_id)
         raise HTTPException(status_code=500, detail=str(e))

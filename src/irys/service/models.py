@@ -113,3 +113,68 @@ class ErrorResponse(BaseModel):
     detail: Optional[str] = None
     code: Optional[str] = None
 
+
+# === File Upload Models ===
+
+
+class UploadInvestigateResponse(BaseModel):
+    """Response from file upload investigation."""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Current job status")
+    message: str = Field(..., description="Status message")
+    files_received: int = Field(..., description="Number of files uploaded")
+    estimated_seconds: Optional[int] = Field(
+        None, description="Estimated completion time"
+    )
+
+
+class UploadSearchResponse(BaseModel):
+    """Response from file upload search."""
+    results: list[SearchResult]
+    total_matches: int
+    files_searched: int
+
+
+# === S3 URL Models ===
+
+
+class S3UrlsInvestigateRequest(BaseModel):
+    """Request to investigate documents by S3 URLs."""
+    query: str = Field(..., description="Investigation query")
+    s3_urls: list[str] = Field(
+        ...,
+        description="List of S3 URLs (s3://bucket/key or https://bucket.s3.region.amazonaws.com/key)",
+        min_length=1,
+        max_length=50,
+    )
+    callback_url: Optional[str] = Field(
+        None, description="URL to POST results when complete"
+    )
+    options: Optional[dict[str, Any]] = Field(
+        default_factory=dict, description="Additional investigation options"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "What are the key payment terms and obligations?",
+                "s3_urls": [
+                    "s3://my-bucket/contracts/main_contract.pdf",
+                    "s3://my-bucket/contracts/amendment_1.pdf",
+                ],
+                "callback_url": "https://your-service.com/webhook/investigation",
+            }
+        }
+
+
+class S3UrlsSearchRequest(BaseModel):
+    """Request for quick search by S3 URLs."""
+    query: str = Field(..., description="Search query")
+    s3_urls: list[str] = Field(
+        ...,
+        description="List of S3 URLs to search",
+        min_length=1,
+        max_length=50,
+    )
+    max_results: int = Field(20, ge=1, le=100, description="Maximum results")
+

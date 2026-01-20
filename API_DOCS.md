@@ -640,6 +640,175 @@ curl "http://localhost:8000/jobs?status=completed&limit=5"
 
 ---
 
+## File Upload Endpoints
+
+Upload documents directly without S3. Useful for testing via Postman.
+
+### Upload & Investigate
+
+Start an investigation with uploaded files.
+
+```
+POST /upload/investigate
+Content-Type: multipart/form-data
+```
+
+**Form Fields:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | ✅ | Investigation question |
+| `files` | file[] | ✅ | Document files (PDF, DOCX, TXT) |
+| `callback_url` | string | ❌ | Webhook URL for results |
+
+**Response:**
+```json
+{
+  "job_id": "upload_abc123def456",
+  "status": "pending",
+  "message": "Investigation started",
+  "files_received": 3,
+  "estimated_seconds": 60
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/upload/investigate \
+  -F "query=What are the payment terms?" \
+  -F "files=@contract.pdf" \
+  -F "files=@amendment.pdf"
+```
+
+### Upload & Search
+
+Quick search across uploaded files (synchronous).
+
+```
+POST /upload/search
+Content-Type: multipart/form-data
+```
+
+**Form Fields:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | ✅ | Search query |
+| `files` | file[] | ✅ | Document files to search |
+| `max_results` | int | ❌ | Maximum results (default: 20) |
+
+**Response:**
+```json
+{
+  "results": [
+    {"file": "contract.pdf", "page": 5, "text": "...matching text..."}
+  ],
+  "total_matches": 12,
+  "files_searched": 2
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/upload/search \
+  -F "query=payment" \
+  -F "files=@contract.pdf" \
+  -F "max_results=10"
+```
+
+---
+
+## S3 URL Endpoints
+
+Download and analyze documents by specific S3 URLs instead of prefixes.
+
+### Investigate by URLs
+
+```
+POST /investigate/urls
+Content-Type: application/json
+```
+
+**Request Body:**
+```json
+{
+  "query": "What are the key terms?",
+  "s3_urls": [
+    "s3://my-bucket/contracts/main.pdf",
+    "s3://my-bucket/contracts/amendment.pdf"
+  ],
+  "callback_url": "https://your-service.com/webhook"
+}
+```
+
+**Supported URL formats:**
+- `s3://bucket/key`
+- `https://bucket.s3.region.amazonaws.com/key`
+- `https://s3.region.amazonaws.com/bucket/key`
+
+**Response:**
+```json
+{
+  "job_id": "urls_abc123def456",
+  "status": "pending",
+  "message": "Investigation started for 2 files",
+  "estimated_seconds": 60
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/investigate/urls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "What are the payment obligations?",
+    "s3_urls": [
+      "s3://my-bucket/docs/contract.pdf",
+      "s3://my-bucket/docs/addendum.pdf"
+    ]
+  }'
+```
+
+### Search by URLs
+
+Quick search across documents from S3 URLs (synchronous).
+
+```
+POST /search/urls
+Content-Type: application/json
+```
+
+**Request Body:**
+```json
+{
+  "query": "payment",
+  "s3_urls": [
+    "s3://my-bucket/contracts/main.pdf"
+  ],
+  "max_results": 20
+}
+```
+
+**Response:**
+```json
+{
+  "results": [...],
+  "total_matches": 8,
+  "documents_searched": 1
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/search/urls \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "liability",
+    "s3_urls": ["s3://my-bucket/contracts/main.pdf"],
+    "max_results": 10
+  }'
+```
+
+---
+
 ## Error Handling
 
 ### Error Response Format

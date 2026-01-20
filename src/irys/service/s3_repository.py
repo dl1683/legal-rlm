@@ -165,3 +165,115 @@ class S3Repository:
 
         return len(expired)
 
+    @staticmethod
+    def parse_s3_url(url: str) -> tuple[str, str]:
+        """Parse S3 URL into bucket and key.
+
+        Supports:
+            - s3://bucket/key
+            - https://bucket.s3.region.amazonaws.com/key
+            - https://s3.region.amazonaws.com/bucket/key
+
+        Returns:
+            Tuple of (bucket, key)
+
+        Raises:
+            ValueError if URL format is not recognized
+        """
+        import re
+
+        # s3:// format
+        if url.startswith("s3://"):
+            parts = url[5:].split("/", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Invalid S3 URL format: {url}")
+            return parts[0], parts[1]
+
+        # https://bucket.s3.region.amazonaws.com/key format
+        match = re.match(
+            r"https://([a-zA-Z0-9.-]+)\.s3\.[a-z0-9-]+\.amazonaws\.com/(.+)",
+            url,
+        )
+        if match:
+            return match.group(1), match.group(2)
+
+        # https://s3.region.amazonaws.com/bucket/key format
+        match = re.match(
+            r"https://s3\.[a-z0-9-]+\.amazonaws\.com/([a-zA-Z0-9.-]+)/(.+)",
+            url,
+        )
+        if match:
+            return match.group(1), match.group(2)
+
+        raise ValueError(f"Unrecognized S3 URL format: {url}")
+
+    async def download_urls_to_temp(
+        self,
+        job_id: str,
+        s3_urls: list[str],
+    ) -> Path:
+        """Download specific S3 URLs to temp directory.
+
+        Args:
+            job_id: Unique job identifier for tracking
+            s3_urls: List of S3 URLs to download
+
+        Returns:
+            Path to temp directory containing downloaded files
+        """
+        # Create temp directory
+        temp_dir = Path(self.config.temp_dir) / job_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Track for cleanup
+        self._temp_dirs[job_id] = (temp_dir, time.time())
+
+        # Check limits
+        if len(s3_urls) > self.config.max_documents_per_job:
+            raise ValueError(
+                f"Too many documents ({len(s3_urls)}). "
+                f"Max: {self.config.max_documents_per_job}"
+            )
+
+        logger.info(f"Downloading {len(s3_urls)} documents for job {job_id}")
+
+        # Download each URL
+        downloaded = 0
+        for url in s3_urls:
+            try:
+                bucket, key = self.parse_s3_url(url)
+                await self._download_url(bucket, key, temp_dir)
+                downloaded += 1
+            except Exception as e:
+                logger.warning(f"Failed to download {url}: {e}")
+
+        logger.info(f"Downloaded {downloaded}/{len(s3_urls)} documents to {temp_dir}")
+        return temp_dir
+
+    async def _download_url(
+        self,
+        bucket: str,
+        key: str,
+        dest_dir: Path,
+    ) -> Path:
+        """Download a single file from S3 by bucket and key."""
+        # Use filename from key, preserving subdirectory structure
+        filename = Path(key).name
+        dest_path = dest_dir / filename
+
+        def _download():
+            # Check file size first
+            head = self._s3.head_object(Bucket=bucket, Key=key)
+            size_mb = head["ContentLength"] / (1024 * 1024)
+
+            if size_mb > self.config.max_document_size_mb:
+                logger.warning(
+                    f"Skipping {key}: {size_mb:.1f}MB exceeds limit"
+                )
+                return None
+
+            self._s3.download_file(bucket, key, str(dest_path))
+            return dest_path
+
+        return await asyncio.to_thread(_download)
+
