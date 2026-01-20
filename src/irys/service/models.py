@@ -68,7 +68,7 @@ class JobResult(BaseModel):
     # Results (only when completed)
     analysis: Optional[str] = None
     citations: Optional[list[dict[str, Any]]] = None
-    entities: Optional[dict[str, list[str]]] = None
+    entities: Optional[dict[str, Any]] = None
     documents_processed: int = 0
     error: Optional[str] = None
 
@@ -140,7 +140,7 @@ class SyncInvestigateResponse(BaseModel):
     query: str
     analysis: str
     citations: list[dict[str, Any]] = []
-    entities: dict[str, list[str]] = {}
+    entities: dict[str, Any] = {}
     documents_processed: int
     duration_seconds: float
     s3_prefix: Optional[str] = Field(None, description="S3 prefix if files were kept")
