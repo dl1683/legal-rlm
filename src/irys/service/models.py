@@ -135,6 +135,16 @@ class UploadSearchResponse(BaseModel):
     files_searched: int
 
 
+class SyncInvestigateResponse(BaseModel):
+    """Response from synchronous investigation."""
+    query: str
+    analysis: str
+    citations: list[dict[str, Any]] = []
+    entities: dict[str, list[str]] = {}
+    documents_processed: int
+    duration_seconds: float
+
+
 # === S3 URL Models ===
 
 

@@ -28,6 +28,7 @@ from .models import (
     ErrorResponse,
     UploadInvestigateResponse,
     UploadSearchResponse,
+    SyncInvestigateResponse,
     S3UrlsInvestigateRequest,
     S3UrlsSearchRequest,
 )
@@ -255,10 +256,10 @@ async def _run_investigation(
         )
 
         # Extract results
-        job.analysis = result.get("analysis", "")
-        job.citations = result.get("citations", [])
-        job.entities = result.get("entities", {})
-        job.documents_processed = result.get("documents_read", 0)
+        job.analysis = result.output
+        job.citations = result.citations
+        job.entities = result.entities
+        job.documents_processed = result.state.documents_read
         job.status = JobStatus.COMPLETED
         job.completed_at = datetime.now()
         job.duration_seconds = (
@@ -493,10 +494,10 @@ async def _run_upload_investigation(
         )
 
         # Extract results
-        job.analysis = result.get("analysis", "")
-        job.citations = result.get("citations", [])
-        job.entities = result.get("entities", {})
-        job.documents_processed = result.get("documents_read", 0)
+        job.analysis = result.output
+        job.citations = result.citations
+        job.entities = result.entities
+        job.documents_processed = result.state.documents_read
         job.status = JobStatus.COMPLETED
         job.completed_at = datetime.now()
         job.duration_seconds = (
@@ -569,6 +570,78 @@ async def upload_search(
         raise
     except Exception as e:
         logger.error(f"Upload search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Cleanup temp files
+        if temp_dir.exists():
+            import shutil
+            shutil.rmtree(temp_dir)
+
+
+@app.post(
+    "/upload/investigate/sync",
+    response_model=SyncInvestigateResponse,
+    tags=["File Upload"],
+    responses={400: {"model": ErrorResponse}},
+)
+async def upload_investigate_sync(
+    query: str = Form(..., description="Investigation query"),
+    files: list[UploadFile] = File(..., description="Document files to analyze"),
+):
+    """Upload and investigate files synchronously.
+
+    Upload documents and run a full investigation, waiting for results.
+    Returns the complete analysis in a single request.
+    Supports PDF, DOCX, and TXT files.
+
+    Note: This endpoint blocks until investigation completes (may take 30-120 seconds).
+    """
+    config = get_config()
+    job_id = f"sync_{uuid.uuid4().hex[:8]}"
+    temp_dir = Path(config.temp_dir) / job_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+
+    try:
+        # Check file count
+        if len(files) > config.max_documents_per_job:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many files ({len(files)}). Max: {config.max_documents_per_job}",
+            )
+
+        # Save uploaded files
+        saved_count = await _save_uploaded_files(files, temp_dir)
+
+        if saved_count == 0:
+            raise HTTPException(status_code=400, detail="No valid files uploaded")
+
+        # Run investigation synchronously
+        from irys import Irys
+        irys = Irys(api_key=config.gemini_api_key)
+
+        result = await irys.investigate(
+            query=query,
+            repository=str(temp_dir),
+        )
+
+        duration = time.time() - start_time
+        logger.info(f"Sync investigation {job_id} completed in {duration:.1f}s")
+
+        return SyncInvestigateResponse(
+            query=query,
+            analysis=result.output,
+            citations=result.citations,
+            entities=result.entities,
+            documents_processed=result.state.documents_read,
+            duration_seconds=round(duration, 2),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Sync investigation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
@@ -670,10 +743,10 @@ async def _run_urls_investigation(
         )
 
         # Extract results
-        job.analysis = result.get("analysis", "")
-        job.citations = result.get("citations", [])
-        job.entities = result.get("entities", {})
-        job.documents_processed = result.get("documents_read", 0)
+        job.analysis = result.output
+        job.citations = result.citations
+        job.entities = result.entities
+        job.documents_processed = result.state.documents_read
         job.status = JobStatus.COMPLETED
         job.completed_at = datetime.now()
         job.duration_seconds = (
