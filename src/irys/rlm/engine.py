@@ -575,6 +575,42 @@ class RLMEngine:
         self.on_step = on_step
         self.on_citation = on_citation
         self.on_progress = on_progress
+        # Global semaphore to limit concurrent CPU-intensive operations
+        self._operation_semaphore: Optional[asyncio.Semaphore] = None
+        self._doc_count: int = 0  # Track document count for adaptive behavior
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        """Get or create the operation semaphore."""
+        if self._operation_semaphore is None:
+            # Limit concurrent operations based on document count
+            # Small repos (<=5 docs): max 2 concurrent ops
+            # Medium repos (6-20 docs): max 3 concurrent ops
+            # Large repos (>20 docs): max 5 concurrent ops
+            if self._doc_count <= 5:
+                max_concurrent = 2
+            elif self._doc_count <= 20:
+                max_concurrent = 3
+            else:
+                max_concurrent = 5
+            self._operation_semaphore = asyncio.Semaphore(max_concurrent)
+        return self._operation_semaphore
+
+    def _adapt_config_for_repo_size(self, doc_count: int):
+        """Adjust config parameters based on repository size."""
+        self._doc_count = doc_count
+
+        if doc_count <= 5:
+            # Small repos: reduce parallelism significantly
+            self.config.max_leads_per_level = min(self.config.max_leads_per_level, 2)
+            self.config.parallel_reads = min(self.config.parallel_reads, 2)
+            self.config.max_iterations = min(self.config.max_iterations, 8)
+            self.config.depth_citation_threshold = min(self.config.depth_citation_threshold, 8)
+        elif doc_count <= 20:
+            # Medium repos: moderate reduction
+            self.config.max_leads_per_level = min(self.config.max_leads_per_level, 3)
+            self.config.parallel_reads = min(self.config.parallel_reads, 3)
+            self.config.max_iterations = min(self.config.max_iterations, 12)
+        # Large repos: use default config
 
     async def investigate(
         self,
@@ -593,6 +629,13 @@ class RLMEngine:
         """
         repo = MatterRepository(repository_path)
         state = InvestigationState.create(query, str(repository_path))
+
+        # Adapt configuration based on repository size
+        stats = repo.get_stats()
+        self._adapt_config_for_repo_size(stats.total_files)
+
+        # Reset semaphore for new investigation
+        self._operation_semaphore = None
 
         # Classify the query
         state.query_classification = classify_query(query)
@@ -757,41 +800,44 @@ class RLMEngine:
         lead: Lead,
     ):
         """Investigate a single lead - may spawn sub-investigations."""
-        state.recursion_depth += 1
-        state.max_depth_reached = max(state.max_depth_reached, state.recursion_depth)
+        # Acquire semaphore to limit concurrent heavy operations
+        async with self._get_semaphore():
+            state.recursion_depth += 1
+            state.max_depth_reached = max(state.max_depth_reached, state.recursion_depth)
 
-        try:
-            effective_depth = self._calculate_effective_depth(state)
-            if state.recursion_depth > effective_depth:
-                state.mark_lead_investigated(lead.id, f"Max depth ({effective_depth}) reached")
-                return
+            try:
+                effective_depth = self._calculate_effective_depth(state)
+                if state.recursion_depth > effective_depth:
+                    state.mark_lead_investigated(lead.id, f"Max depth ({effective_depth}) reached")
+                    return
 
-            self._emit_step(state, StepType.SEARCH, f"Investigating: {lead.description}")
+                self._emit_step(state, StepType.SEARCH, f"Investigating: {lead.description}")
 
-            # Extract search term from lead
-            search_term = self._extract_search_term(lead.description)
+                # Extract search term from lead
+                search_term = self._extract_search_term(lead.description)
 
-            # Perform search
-            results = repo.search(search_term, context_lines=3)
-            state.searches_performed += 1
+                # Perform search (scale workers based on doc count)
+                max_workers = min(4, max(1, self._doc_count))
+                results = repo.search(search_term, context_lines=3, max_workers=max_workers)
+                state.searches_performed += 1
 
-            if not results.hits:
-                state.mark_lead_investigated(lead.id, "No results found")
-                return
+                if not results.hits:
+                    state.mark_lead_investigated(lead.id, "No results found")
+                    return
 
-            self._emit_step(
-                state,
-                StepType.FINDING,
-                f"Found {len(results.hits)} matches in {results.files_searched} files",
-            )
+                self._emit_step(
+                    state,
+                    StepType.FINDING,
+                    f"Found {len(results.hits)} matches in {results.files_searched} files",
+                )
 
-            # Analyze top results
-            await self._analyze_search_results(state, repo, results, lead)
+                # Analyze top results
+                await self._analyze_search_results(state, repo, results, lead)
 
-            state.mark_lead_investigated(lead.id, f"Found {len(results.hits)} matches")
+                state.mark_lead_investigated(lead.id, f"Found {len(results.hits)} matches")
 
-        finally:
-            state.recursion_depth -= 1
+            finally:
+                state.recursion_depth -= 1
 
     async def _analyze_search_results(
         self,
@@ -876,21 +922,25 @@ class RLMEngine:
         repo: MatterRepository,
         file_paths: list[str],
     ):
-        """Process multiple documents in parallel."""
+        """Process multiple documents with controlled parallelism."""
         if not file_paths:
             return
 
         self._emit_step(
             state,
             StepType.READING,
-            f"Deep reading {len(file_paths)} documents in parallel",
+            f"Deep reading {len(file_paths)} documents",
         )
 
-        # Process all documents in parallel
-        tasks = [
-            self._deep_read_document(state, repo, fp)
-            for fp in file_paths
-        ]
+        # Use semaphore to limit concurrent document processing
+        # This prevents CPU overload from too many parallel PDF parses + LLM calls
+        read_semaphore = asyncio.Semaphore(self.config.parallel_reads)
+
+        async def limited_read(fp: str):
+            async with read_semaphore:
+                return await self._deep_read_document(state, repo, fp)
+
+        tasks = [limited_read(fp) for fp in file_paths]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Log any errors
@@ -1400,10 +1450,11 @@ class RLMEngine:
     def _should_continue_investigation(self, state: InvestigationState) -> tuple[bool, str]:
         """Determine if investigation should continue.
 
-        Uses three criteria:
-        1. Query complexity - simpler queries terminate faster
-        2. Diminishing returns - stop if recent iterations add few new facts
-        3. Verified citations - keep this requirement (per user preference)
+        Uses four criteria:
+        1. Repository size - small repos terminate faster
+        2. Query complexity - simpler queries terminate faster
+        3. Diminishing returns - stop if recent iterations add few new facts
+        4. Verified citations - keep this requirement (per user preference)
 
         Returns:
             (should_continue, reason) - reason explains why we stopped/continue
@@ -1435,19 +1486,36 @@ class RLMEngine:
         complexity_adjustment = (complexity - 3) * 5  # -10 to +10 adjustment
         conf_threshold = max(50, min(90, conf_threshold + complexity_adjustment))
 
+        # NEW: Adjust thresholds for small document sets
+        # With fewer documents, we need fewer citations and can terminate earlier
+        if self._doc_count <= 5:
+            min_citations = min(min_citations, max(2, self._doc_count))
+            conf_threshold = max(40, conf_threshold - 15)
+        elif self._doc_count <= 10:
+            min_citations = min(min_citations, self._doc_count)
+            conf_threshold = max(45, conf_threshold - 10)
+
         # Check 1: Query complexity-aware confidence check
         if confidence["score"] >= conf_threshold and len(state.citations) >= min_citations:
             return False, f"Sufficient evidence for {query_type} query (confidence: {confidence['score']:.0f}%, {len(state.citations)} citations)"
 
-        # Check 2: Diminishing returns - stop if last 2 iterations added < 3 facts each
+        # Check 2: For small repos, terminate if we've read all documents
+        if self._doc_count > 0 and state.documents_read >= self._doc_count:
+            if len(state.citations) >= 1:  # At least some evidence found
+                return False, f"All {self._doc_count} documents processed"
+
+        # Check 3: Diminishing returns - stop if last 2 iterations added < 3 facts each
+        # For small repos, be more aggressive (< 2 facts)
+        fact_threshold = 2 if self._doc_count <= 5 else 3
         if len(state.facts_per_iteration) >= 2:
             recent_facts = state.facts_per_iteration[-2:]
-            if all(f < 3 for f in recent_facts):
+            if all(f < fact_threshold for f in recent_facts):
                 # Diminishing returns detected - but only stop if we have SOME evidence
-                if len(state.citations) >= 3 and confidence["score"] >= 40:
+                min_citations_for_stop = 2 if self._doc_count <= 5 else 3
+                if len(state.citations) >= min_citations_for_stop and confidence["score"] >= 40:
                     return False, f"Diminishing returns (last 2 iterations: {recent_facts[0]}, {recent_facts[1]} new facts)"
 
-        # Check 3: Extreme diminishing returns - 3 iterations with 0-1 facts each
+        # Check 4: Extreme diminishing returns - 3 iterations with 0-1 facts each
         if len(state.facts_per_iteration) >= 3:
             recent_facts = state.facts_per_iteration[-3:]
             if all(f <= 1 for f in recent_facts):
