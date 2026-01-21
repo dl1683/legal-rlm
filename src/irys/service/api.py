@@ -841,10 +841,11 @@ async def investigate_urls(
     request: S3UrlsInvestigateRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Start investigation with specific S3 URLs.
+    """Start investigation with document URLs.
 
-    Provide a list of S3 URLs to download and analyze.
-    Supports s3:// and https:// S3 URL formats.
+    Provide a list of URLs to download and analyze. Supports:
+    - S3 URLs: s3://bucket/key, https://bucket.s3.region.amazonaws.com/key
+    - Generic HTTP(S) URLs: https://example.com/document.pdf
     """
     config = get_config()
 
@@ -953,9 +954,12 @@ async def _run_urls_investigation(
     tags=["S3 URLs"],
 )
 async def search_urls(request: S3UrlsSearchRequest):
-    """Quick keyword search across documents from S3 URLs.
+    """Quick keyword search across documents from URLs.
 
-    Provide a list of S3 URLs to download and search.
+    Provide a list of URLs to download and search. Supports:
+    - S3 URLs: s3://bucket/key, https://bucket.s3.region.amazonaws.com/key
+    - Generic HTTP(S) URLs: https://example.com/document.pdf
+
     Synchronous - returns results immediately.
     """
     config = get_config()
@@ -1004,12 +1008,13 @@ async def search_urls(request: S3UrlsSearchRequest):
     responses={400: {"model": ErrorResponse}},
 )
 async def investigate_urls_sync(request: S3UrlsInvestigateRequest):
-    """Investigate documents from S3 URLs synchronously.
+    """Investigate documents from URLs synchronously.
 
-    Provide a list of S3 URLs to download and analyze.
+    Provide a list of URLs to download and analyze. Supports:
+    - S3 URLs: s3://bucket/key, https://bucket.s3.region.amazonaws.com/key
+    - Generic HTTP(S) URLs: https://example.com/document.pdf
+
     Returns complete results in a single request (blocks until done).
-    Supports s3:// and https:// S3 URL formats.
-
     Note: This endpoint blocks until investigation completes (may take 30-120 seconds).
     """
     config = get_config()

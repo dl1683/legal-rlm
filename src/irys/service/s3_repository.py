@@ -7,14 +7,17 @@ with automatic cleanup to keep disk usage low.
 import asyncio
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import AsyncIterator, Optional
 from contextlib import asynccontextmanager
+from urllib.parse import unquote_plus
 
 import boto3
+import httpx
 from botocore.exceptions import ClientError
 
 from .config import ServiceConfig, get_config
@@ -166,6 +169,30 @@ class S3Repository:
         return len(expired)
 
     @staticmethod
+    def is_s3_url(url: str) -> bool:
+        """Check if URL is an S3 URL.
+
+        Returns True for:
+            - s3://bucket/key
+            - https://bucket.s3.region.amazonaws.com/key
+            - https://s3.region.amazonaws.com/bucket/key
+
+        Returns False for regular HTTP(S) URLs.
+        """
+        if url.startswith("s3://"):
+            return True
+
+        # https://bucket.s3.region.amazonaws.com/key format
+        if re.match(r"https://[a-zA-Z0-9.-]+\.s3\.[a-z0-9-]+\.amazonaws\.com/", url):
+            return True
+
+        # https://s3.region.amazonaws.com/bucket/key format
+        if re.match(r"https://s3\.[a-z0-9-]+\.amazonaws\.com/", url):
+            return True
+
+        return False
+
+    @staticmethod
     def parse_s3_url(url: str) -> tuple[str, str]:
         """Parse S3 URL into bucket and key.
 
@@ -175,19 +202,17 @@ class S3Repository:
             - https://s3.region.amazonaws.com/bucket/key
 
         Returns:
-            Tuple of (bucket, key)
+            Tuple of (bucket, key) - key is URL-decoded
 
         Raises:
             ValueError if URL format is not recognized
         """
-        import re
-
         # s3:// format
         if url.startswith("s3://"):
             parts = url[5:].split("/", 1)
             if len(parts) != 2:
                 raise ValueError(f"Invalid S3 URL format: {url}")
-            return parts[0], parts[1]
+            return parts[0], unquote_plus(parts[1])
 
         # https://bucket.s3.region.amazonaws.com/key format
         match = re.match(
@@ -195,7 +220,7 @@ class S3Repository:
             url,
         )
         if match:
-            return match.group(1), match.group(2)
+            return match.group(1), unquote_plus(match.group(2))
 
         # https://s3.region.amazonaws.com/bucket/key format
         match = re.match(
@@ -203,20 +228,24 @@ class S3Repository:
             url,
         )
         if match:
-            return match.group(1), match.group(2)
+            return match.group(1), unquote_plus(match.group(2))
 
         raise ValueError(f"Unrecognized S3 URL format: {url}")
 
     async def download_urls_to_temp(
         self,
         job_id: str,
-        s3_urls: list[str],
+        urls: list[str],
     ) -> Path:
-        """Download specific S3 URLs to temp directory.
+        """Download documents from URLs to temp directory.
+
+        Supports:
+            - S3 URLs: s3://bucket/key, https://bucket.s3.region.amazonaws.com/key
+            - Generic HTTP(S) URLs: https://example.com/document.pdf
 
         Args:
             job_id: Unique job identifier for tracking
-            s3_urls: List of S3 URLs to download
+            urls: List of URLs to download (S3 or HTTP)
 
         Returns:
             Path to temp directory containing downloaded files
@@ -229,25 +258,40 @@ class S3Repository:
         self._temp_dirs[job_id] = (temp_dir, time.time())
 
         # Check limits
-        if len(s3_urls) > self.config.max_documents_per_job:
+        if len(urls) > self.config.max_documents_per_job:
             raise ValueError(
-                f"Too many documents ({len(s3_urls)}). "
+                f"Too many documents ({len(urls)}). "
                 f"Max: {self.config.max_documents_per_job}"
             )
 
-        logger.info(f"Downloading {len(s3_urls)} documents for job {job_id}")
+        logger.info(f"Downloading {len(urls)} documents for job {job_id}")
 
         # Download each URL
         downloaded = 0
-        for url in s3_urls:
+        errors = []
+        for url in urls:
             try:
-                bucket, key = self.parse_s3_url(url)
-                await self._download_url(bucket, key, temp_dir)
+                if self.is_s3_url(url):
+                    # S3 URL - use S3 client
+                    bucket, key = self.parse_s3_url(url)
+                    await self._download_url(bucket, key, temp_dir)
+                else:
+                    # Generic HTTP(S) URL
+                    await self._download_http_url(url, temp_dir)
                 downloaded += 1
             except Exception as e:
-                logger.warning(f"Failed to download {url}: {e}")
+                error_msg = f"Failed to download {url}: {e}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
 
-        logger.info(f"Downloaded {downloaded}/{len(s3_urls)} documents to {temp_dir}")
+        logger.info(f"Downloaded {downloaded}/{len(urls)} documents to {temp_dir}")
+
+        # Raise error if no files were downloaded
+        if downloaded == 0:
+            raise ValueError(
+                f"Failed to download any documents. Errors: {'; '.join(errors)}"
+            )
+
         return temp_dir
 
     async def _download_url(
@@ -276,6 +320,70 @@ class S3Repository:
             return dest_path
 
         return await asyncio.to_thread(_download)
+
+    async def _download_http_url(
+        self,
+        url: str,
+        dest_dir: Path,
+    ) -> Optional[Path]:
+        """Download a file from a generic HTTP(S) URL.
+
+        Args:
+            url: HTTP(S) URL to download
+            dest_dir: Destination directory
+
+        Returns:
+            Path to downloaded file, or None if skipped/failed
+        """
+        # Extract filename from URL
+        from urllib.parse import urlparse, unquote
+        parsed = urlparse(url)
+        filename = unquote(Path(parsed.path).name)
+
+        if not filename:
+            logger.warning(f"Could not extract filename from URL: {url}")
+            return None
+
+        dest_path = dest_dir / filename
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            # First, do a HEAD request to check size
+            try:
+                head_response = await client.head(url)
+                head_response.raise_for_status()
+
+                content_length = head_response.headers.get("content-length")
+                if content_length:
+                    size_mb = int(content_length) / (1024 * 1024)
+                    if size_mb > self.config.max_document_size_mb:
+                        logger.warning(
+                            f"Skipping {url}: {size_mb:.1f}MB exceeds limit"
+                        )
+                        return None
+            except httpx.HTTPError as e:
+                logger.warning(f"HEAD request failed for {url}: {e}")
+                # Continue with GET anyway, some servers don't support HEAD
+
+            # Download the file
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+
+                # Check size from actual content
+                size_mb = len(response.content) / (1024 * 1024)
+                if size_mb > self.config.max_document_size_mb:
+                    logger.warning(
+                        f"Skipping {url}: {size_mb:.1f}MB exceeds limit"
+                    )
+                    return None
+
+                dest_path.write_bytes(response.content)
+                logger.debug(f"Downloaded {url} to {dest_path}")
+                return dest_path
+
+            except httpx.HTTPError as e:
+                logger.error(f"Failed to download {url}: {e}")
+                raise
 
     async def upload_files(
         self,

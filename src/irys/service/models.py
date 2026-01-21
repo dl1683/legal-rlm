@@ -150,11 +150,15 @@ class SyncInvestigateResponse(BaseModel):
 
 
 class S3UrlsInvestigateRequest(BaseModel):
-    """Request to investigate documents by S3 URLs."""
+    """Request to investigate documents by URLs (S3 or HTTP)."""
     query: str = Field(..., description="Investigation query")
     s3_urls: list[str] = Field(
         ...,
-        description="List of S3 URLs (s3://bucket/key or https://bucket.s3.region.amazonaws.com/key)",
+        description=(
+            "List of document URLs. Supports: "
+            "S3 URLs (s3://bucket/key, https://bucket.s3.region.amazonaws.com/key) "
+            "and generic HTTP(S) URLs (https://example.com/document.pdf)"
+        ),
         min_length=1,
         max_length=50,
     )
@@ -171,7 +175,8 @@ class S3UrlsInvestigateRequest(BaseModel):
                 "query": "What are the key payment terms and obligations?",
                 "s3_urls": [
                     "s3://my-bucket/contracts/main_contract.pdf",
-                    "s3://my-bucket/contracts/amendment_1.pdf",
+                    "https://my-bucket.s3.us-east-1.amazonaws.com/contracts/amendment.pdf",
+                    "https://example.com/documents/terms.pdf",
                 ],
                 "callback_url": "https://your-service.com/webhook/investigation",
             }
@@ -179,11 +184,15 @@ class S3UrlsInvestigateRequest(BaseModel):
 
 
 class S3UrlsSearchRequest(BaseModel):
-    """Request for quick search by S3 URLs."""
+    """Request for quick search by URLs (S3 or HTTP)."""
     query: str = Field(..., description="Search query")
     s3_urls: list[str] = Field(
         ...,
-        description="List of S3 URLs to search",
+        description=(
+            "List of document URLs. Supports: "
+            "S3 URLs (s3://bucket/key, https://bucket.s3.region.amazonaws.com/key) "
+            "and generic HTTP(S) URLs (https://example.com/document.pdf)"
+        ),
         min_length=1,
         max_length=50,
     )
