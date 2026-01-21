@@ -149,15 +149,26 @@ class SyncInvestigateResponse(BaseModel):
 # === S3 URL Models ===
 
 
+class UrlWithMetadata(BaseModel):
+    """URL with optional metadata for file type detection."""
+    url: str = Field(..., description="Document URL")
+    name: Optional[str] = Field(None, description="Original filename (e.g., 'Contract.pdf')")
+    mime: Optional[str] = Field(None, description="MIME type (e.g., 'application/pdf')")
+
+
+# Type alias for URL input - can be string or object with metadata
+UrlInput = str | UrlWithMetadata
+
+
 class S3UrlsInvestigateRequest(BaseModel):
     """Request to investigate documents by URLs (S3 or HTTP)."""
     query: str = Field(..., description="Investigation query")
-    s3_urls: list[str] = Field(
+    s3_urls: list[UrlInput] = Field(
         ...,
         description=(
-            "List of document URLs. Supports: "
-            "S3 URLs (s3://bucket/key, https://bucket.s3.region.amazonaws.com/key) "
-            "and generic HTTP(S) URLs (https://example.com/document.pdf)"
+            "List of document URLs. Each item can be a string URL or an object with "
+            "'url', 'name' (filename), and 'mime' (MIME type) fields. "
+            "Supports S3 URLs and generic HTTP(S) URLs including presigned URLs."
         ),
         min_length=1,
         max_length=50,
@@ -175,8 +186,11 @@ class S3UrlsInvestigateRequest(BaseModel):
                 "query": "What are the key payment terms and obligations?",
                 "s3_urls": [
                     "s3://my-bucket/contracts/main_contract.pdf",
-                    "https://my-bucket.s3.us-east-1.amazonaws.com/contracts/amendment.pdf",
-                    "https://example.com/documents/terms.pdf",
+                    {
+                        "url": "https://bucket.s3.amazonaws.com/abc123?X-Amz-Signature=...",
+                        "name": "Contract.pdf",
+                        "mime": "application/pdf"
+                    },
                 ],
                 "callback_url": "https://your-service.com/webhook/investigation",
             }
@@ -186,12 +200,11 @@ class S3UrlsInvestigateRequest(BaseModel):
 class S3UrlsSearchRequest(BaseModel):
     """Request for quick search by URLs (S3 or HTTP)."""
     query: str = Field(..., description="Search query")
-    s3_urls: list[str] = Field(
+    s3_urls: list[UrlInput] = Field(
         ...,
         description=(
-            "List of document URLs. Supports: "
-            "S3 URLs (s3://bucket/key, https://bucket.s3.region.amazonaws.com/key) "
-            "and generic HTTP(S) URLs (https://example.com/document.pdf)"
+            "List of document URLs. Each item can be a string URL or an object with "
+            "'url', 'name' (filename), and 'mime' (MIME type) fields."
         ),
         min_length=1,
         max_length=50,
