@@ -40,10 +40,16 @@ class RepositoryStats:
     total_size_bytes: int
     files_by_type: dict[str, int]
     folders: list[str]
+    skipped_legacy_files: int = 0  # Count of .doc/.rtf files that can't be processed
 
     @property
     def size_mb(self) -> float:
         return self.total_size_bytes / (1024 * 1024)
+
+    @property
+    def has_legacy_files(self) -> bool:
+        """True if there are legacy files that couldn't be processed."""
+        return self.skipped_legacy_files > 0
 
 
 class MatterRepository:
@@ -52,12 +58,15 @@ class MatterRepository:
 
     Provides:
     - File listing and navigation
-    - Document reading (PDF, DOCX, TXT)
+    - Document reading (PDF, DOCX, TXT, MHT)
     - Grep-style search across all documents
     - Parallel operations
+
+    Note: Old .doc (binary) and .rtf formats are NOT supported.
+    Convert to .docx or .pdf before adding to repository.
     """
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
+    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".mht", ".mhtml"}
 
     def __init__(self, base_path: str | Path):
         self.base_path = Path(base_path)
@@ -123,24 +132,59 @@ class MatterRepository:
         return dict(sorted(structure.items()))
 
     def get_stats(self) -> RepositoryStats:
-        """Get repository statistics."""
-        files = self.list_files()
+        """Get repository statistics.
 
+        Also detects and counts legacy files (.doc, .rtf) that exist
+        but cannot be processed. Logs a single summary warning if any
+        legacy files are found.
+        """
         files_by_type: dict[str, int] = {}
         total_size = 0
         folders = set()
+        total_files = 0
 
-        for f in files:
-            files_by_type[f.file_type] = files_by_type.get(f.file_type, 0) + 1
-            total_size += f.size_bytes
-            folder = str(Path(f.relative_path).parent)
-            folders.add(folder)
+        # Legacy file tracking
+        legacy_extensions = {".doc", ".rtf"}
+        skipped_legacy = 0
+        legacy_samples: list[str] = []  # Track a few for the warning
+
+        # Single traversal: count supported and legacy files
+        for path in self.base_path.glob("**/*"):
+            if not path.is_file() or path.name.startswith("~$"):
+                continue
+
+            ext = path.suffix.lower()
+
+            if ext in self.SUPPORTED_EXTENSIONS:
+                total_files += 1
+                files_by_type[ext] = files_by_type.get(ext, 0) + 1
+                total_size += path.stat().st_size
+                rel_path = str(path.relative_to(self.base_path))
+                folder = str(Path(rel_path).parent)
+                if folder == ".":
+                    folder = "(root)"  # Normalize to match get_structure()
+                folders.add(folder)
+            elif ext in legacy_extensions:
+                skipped_legacy += 1
+                if len(legacy_samples) < 3:  # Collect up to 3 samples
+                    legacy_samples.append(str(path.relative_to(self.base_path)))
+
+        # Log a single summary warning if legacy files found
+        if skipped_legacy > 0:
+            samples_str = ", ".join(legacy_samples)
+            if skipped_legacy > 3:
+                samples_str += f", ... ({skipped_legacy - 3} more)"
+            logger.warning(
+                f"Repository contains {skipped_legacy} unsupported legacy file(s) "
+                f"(.doc/.rtf): {samples_str}. Convert to .docx or .pdf for processing."
+            )
 
         return RepositoryStats(
-            total_files=len(files),
+            total_files=total_files,
             total_size_bytes=total_size,
             files_by_type=files_by_type,
             folders=sorted(folders),
+            skipped_legacy_files=skipped_legacy,
         )
 
     # === READING ===
@@ -255,6 +299,36 @@ class MatterRepository:
         files = [f.path for f in self.list_files(pattern, file_types)]
 
         return self.search_engine.search(
+            query=query,
+            files=files,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            context_lines=context_lines,
+        )
+
+    def smart_search(
+        self,
+        query: str,
+        folder: Optional[str] = None,
+        file_types: Optional[list[str]] = None,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        context_lines: int = 2,
+    ) -> SearchResults:
+        """
+        Smart search with OR fallback for multi-word queries.
+
+        If exact phrase returns no results, automatically splits into
+        individual terms and searches for each, deduplicating results.
+        """
+        if folder:
+            pattern = f"{folder}/**/*"
+        else:
+            pattern = "**/*"
+
+        files = [f.path for f in self.list_files(pattern, file_types)]
+
+        return self.search_engine.smart_search(
             query=query,
             files=files,
             regex=regex,

@@ -1,4 +1,4 @@
-"""Document reader for PDF and DOCX files.
+"""Document reader for PDF, DOCX, and MHT files.
 
 Extracts text with page/section preservation for citation tracking.
 """
@@ -7,9 +7,42 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 import re
+import email
+from email import policy
+from html.parser import HTMLParser
 
 import fitz  # PyMuPDF
 from docx import Document
+
+
+class HTMLTextExtractor(HTMLParser):
+    """Extract text from HTML, stripping tags."""
+
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+        self.skip_tags = {'script', 'style', 'head', 'meta', 'link'}
+        self.current_skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self.skip_tags:
+            self.current_skip += 1
+        # Add spacing for block elements
+        if tag.lower() in {'p', 'div', 'br', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+            self.text_parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self.skip_tags:
+            self.current_skip = max(0, self.current_skip - 1)
+        if tag.lower() in {'p', 'div', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}:
+            self.text_parts.append('\n')
+
+    def handle_data(self, data):
+        if self.current_skip == 0:
+            self.text_parts.append(data)
+
+    def get_text(self) -> str:
+        return ''.join(self.text_parts)
 
 
 @dataclass
@@ -56,9 +89,13 @@ class DocumentContent:
 
 
 class DocumentReader:
-    """Read and extract text from PDF and DOCX files."""
+    """Read and extract text from PDF, DOCX, TXT, and MHT files.
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".rtf"}
+    Note: Old .doc (binary) and .rtf formats are NOT supported.
+    Convert to .docx or .pdf before processing.
+    """
+
+    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".mht", ".mhtml"}
 
     def read(self, path: Path | str) -> DocumentContent:
         """Read a document and extract text."""
@@ -71,10 +108,17 @@ class DocumentReader:
 
         if suffix == ".pdf":
             return self._read_pdf(path)
-        elif suffix in {".docx", ".doc"}:
+        elif suffix == ".docx":
             return self._read_docx(path)
         elif suffix == ".txt":
             return self._read_txt(path)
+        elif suffix in {".mht", ".mhtml"}:
+            return self._read_mht(path)
+        elif suffix in {".doc", ".rtf"}:
+            raise ValueError(
+                f"Unsupported legacy format: {suffix}. "
+                f"Please convert to .docx or .pdf first."
+            )
         else:
             raise ValueError(f"Unsupported file type: {suffix}")
 
@@ -84,13 +128,14 @@ class DocumentReader:
         pages = []
         total_chars = 0
 
-        for page_num, page in enumerate(doc, start=1):
-            text = page.get_text()
-            text = self._clean_text(text)
-            pages.append(PageContent(page_num=page_num, text=text))
-            total_chars += len(text)
-
-        doc.close()
+        try:
+            for page_num, page in enumerate(doc, start=1):
+                text = page.get_text()
+                text = self._clean_text(text)
+                pages.append(PageContent(page_num=page_num, text=text))
+                total_chars += len(text)
+        finally:
+            doc.close()
 
         return DocumentContent(
             path=str(path),
@@ -140,6 +185,87 @@ class DocumentReader:
             path=str(path),
             filename=path.name,
             file_type="txt",
+            page_count=1,
+            pages=pages,
+            total_chars=len(text),
+        )
+
+    def _read_mht(self, path: Path) -> DocumentContent:
+        """Read MIME HTML (MHT/MHTML) file and extract text.
+
+        MHT files are MIME-encoded web archives that contain HTML content.
+        We extract the HTML and convert it to plain text.
+        """
+        # Read the raw content
+        raw_content = path.read_bytes()
+
+        # Try to parse as MIME message
+        try:
+            msg = email.message_from_bytes(raw_content, policy=policy.default)
+            html_content = None
+
+            # Walk through MIME parts to find HTML
+            if msg.is_multipart():
+                for part in msg.walk():
+                    content_type = part.get_content_type()
+                    if content_type == 'text/html':
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            # Try different encodings
+                            for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                                try:
+                                    html_content = payload.decode(encoding)
+                                    break
+                                except UnicodeDecodeError:
+                                    continue
+                        break
+            else:
+                # Single-part message
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                        try:
+                            html_content = payload.decode(encoding)
+                            break
+                        except UnicodeDecodeError:
+                            continue
+
+            # Fallback: try reading as raw text with HTML
+            if not html_content:
+                raw_text = raw_content.decode('utf-8', errors='replace')
+                # Look for HTML content between markers
+                if '<html' in raw_text.lower():
+                    html_content = raw_text
+        except Exception:
+            # Final fallback: read as text and extract what we can
+            html_content = path.read_text(encoding='utf-8', errors='replace')
+
+        # Extract text from HTML
+        if html_content:
+            # Handle quoted-printable encoding artifacts
+            html_content = html_content.replace('=\n', '')  # Line continuations
+            html_content = re.sub(r'=([0-9A-Fa-f]{2})',
+                                  lambda m: chr(int(m.group(1), 16)),
+                                  html_content)
+
+            # Use regex-based extraction (more robust than HTMLParser for MHT files)
+            # Remove script and style content
+            text = re.sub(r'<script[^>]*>.*?</script>', '', html_content,
+                          flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<style[^>]*>.*?</style>', '', text,
+                          flags=re.DOTALL | re.IGNORECASE)
+            # Strip remaining tags
+            text = re.sub(r'<[^>]+>', ' ', text)
+        else:
+            text = ""
+
+        text = self._clean_text(text)
+        pages = [PageContent(page_num=1, text=text)]
+
+        return DocumentContent(
+            path=str(path),
+            filename=path.name,
+            file_type="mht",
             page_count=1,
             pages=pages,
             total_chars=len(text),

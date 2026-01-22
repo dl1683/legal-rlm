@@ -273,11 +273,25 @@ class InvestigationResult:
 
     @property
     def confidence(self) -> dict:
-        return self.state.get_confidence_score()
+        """Simple confidence based on evidence gathered."""
+        citations = len(self.state.citations)
+        facts = len(self.state.findings.get("accumulated_facts", []))
+        docs = self.state.documents_read
+
+        # Simple score: more evidence = higher confidence
+        score = min(100, citations * 5 + facts * 2 + docs * 3)
+        level = "high" if score >= 70 else "medium" if score >= 40 else "low"
+
+        return {"score": score, "level": level}
 
     @property
-    def quality(self):
-        return self.state.assess_answer_quality()
+    def quality(self) -> dict:
+        """Simple quality assessment."""
+        return {
+            "citations": len(self.state.citations),
+            "facts": len(self.state.findings.get("accumulated_facts", [])),
+            "documents_read": self.state.documents_read,
+        }
 
     def to_format(self, format_type: str) -> str:
         """Convert to different output format."""

@@ -16,6 +16,11 @@ import logging
 from google import genai
 from google.genai import types
 
+# Import ResponseCache with TYPE_CHECKING to avoid circular imports
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .cache import ResponseCache
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,6 +156,7 @@ class GeminiClient:
         timeout: float = DEFAULT_TIMEOUT,
         requests_per_minute: int = DEFAULT_RPM,
         burst_size: int = DEFAULT_BURST,
+        cache: Optional["ResponseCache"] = None,
     ):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
@@ -158,6 +164,7 @@ class GeminiClient:
 
         self.client = genai.Client(api_key=self.api_key)
         self.timeout = timeout
+        self._cache = cache
         self._usage: dict[ModelTier, UsageStats] = {t: UsageStats() for t in ModelTier}
         self._rate_limiter = RateLimiter(requests_per_minute, burst_size)
 
@@ -179,11 +186,35 @@ class GeminiClient:
         system_prompt: Optional[str] = None,
         tools: Optional[list] = None,
         timeout: Optional[float] = None,
+        use_cache: bool = True,
     ) -> str:
-        """Generate completion using specified tier with timeout."""
+        """Generate completion using specified tier with timeout.
+
+        Args:
+            prompt: The prompt to send to the model
+            tier: Model tier to use (LITE, FLASH, PRO)
+            system_prompt: Optional system prompt
+            tools: Optional tools for function calling
+            timeout: Optional custom timeout
+            use_cache: Whether to use response cache (default True)
+
+        Returns:
+            The model's response text
+        """
         mc = MODEL_CONFIGS[tier]
         config = self._get_config(tier)
         request_timeout = timeout or self.timeout
+
+        # Build cache key (only cache if no tools and cache enabled)
+        cache_enabled = use_cache and self._cache and not tools
+        cache_key_prompt = f"{system_prompt or ''}:{prompt}" if system_prompt else prompt
+
+        # Check cache first
+        if cache_enabled:
+            cached = self._cache.get(cache_key_prompt, mc.model_id)
+            if cached:
+                logger.debug(f"Cache hit for {mc.model_id}")
+                return cached
 
         if tools:
             config.tools = tools
@@ -226,8 +257,15 @@ class GeminiClient:
         estimated_output = len(response.text) // 4 if response.text else 0
         self._usage[tier].add(estimated_input, estimated_output)
 
-        logger.debug(f"Got response: {len(response.text) if response.text else 0} chars")
-        return response.text
+        response_text = response.text or ""
+
+        # Store in cache
+        if cache_enabled and response_text:
+            self._cache.set(cache_key_prompt, mc.model_id, response_text)
+            logger.debug(f"Cached response for {mc.model_id}")
+
+        logger.debug(f"Got response: {len(response_text)} chars")
+        return response_text
 
     async def complete_with_retry(
         self,
