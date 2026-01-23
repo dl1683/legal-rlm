@@ -249,6 +249,12 @@ Extract:
    - If a table or comparison exists, extract each row's data
 2. Key quotes with page numbers - use VERBATIM text
 3. References to other documents or exhibits
+4. External research triggers - things that suggest we need to look up external sources:
+   - Jurisdictions mentioned (e.g., "Michigan law", "Federal court", "UK jurisdiction")
+   - Regulations/statutes cited (e.g., "FAA Part 91", "UCC § 2-314", "GDPR")
+   - Legal doctrines referenced (e.g., "breach of warranty", "negligent misrepresentation")
+   - Industry standards mentioned (e.g., "192-month inspection", "GAAP", "ISO 9001")
+   - Case law or precedents cited (e.g., specific case names)
 
 Also provide your analysis:
 - What did you learn from this document that helps answer the query?
@@ -264,7 +270,14 @@ Reply in JSON:
     "references": ["mentioned_doc1.pdf", "mentioned_doc2.pdf"],
     "insights": "What I learned from this document and how it helps answer the query",
     "gaps": "What information is still missing or unclear",
-    "next_steps": "What we should look for next based on what we found"
+    "next_steps": "What we should look for next based on what we found",
+    "external_triggers": {{
+        "jurisdictions": ["any jurisdictions mentioned"],
+        "regulations_statutes": ["any regulations, statutes, or legal codes cited"],
+        "legal_doctrines": ["any legal theories or doctrines referenced"],
+        "industry_standards": ["any industry standards or practices mentioned"],
+        "case_references": ["any case law or precedents cited"]
+    }}
 }}"""
 
 
