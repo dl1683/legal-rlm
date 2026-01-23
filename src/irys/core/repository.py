@@ -52,6 +52,14 @@ class RepositoryStats:
         return self.skipped_legacy_files > 0
 
 
+@dataclass
+class RepositoryMetadata:
+    """Metadata about repository content size."""
+    total_files: int
+    total_chars: int
+    learnings: dict[str, str] = field(default_factory=dict)  # query -> key facts
+
+
 class MatterRepository:
     """
     Programmatic access to a legal matter document repository.
@@ -80,7 +88,73 @@ class MatterRepository:
         self.search_engine = DocumentSearch(self.reader)
         self.search_engine._doc_cache = self._doc_cache  # Share cache
         self._file_cache: Optional[list[FileInfo]] = None
+        self._metadata: Optional["RepositoryMetadata"] = None
         logger.info(f"Initialized repository: {base_path}")
+
+    @property
+    def is_small_repo(self) -> bool:
+        """Check if repository is small enough for direct content loading."""
+        SMALL_REPO_THRESHOLD = 100_000  # 100K chars
+        if self._metadata is None:
+            self._compute_metadata()
+        return self._metadata.total_chars < SMALL_REPO_THRESHOLD
+
+    @property
+    def metadata(self) -> Optional["RepositoryMetadata"]:
+        """Get repository metadata (lazy computed)."""
+        if self._metadata is None:
+            self._compute_metadata()
+        return self._metadata
+
+    def _compute_metadata(self) -> None:
+        """Compute and cache repository metadata."""
+        files = self.list_files()
+        total_chars = 0
+        for f in files[:50]:  # Sample first 50 files to estimate
+            try:
+                doc = self.read(f.path)
+                total_chars += len(doc.full_text)
+            except Exception:
+                pass
+        # Extrapolate if we sampled
+        if len(files) > 50:
+            total_chars = int(total_chars * len(files) / 50)
+        self._metadata = RepositoryMetadata(
+            total_files=len(files),
+            total_chars=total_chars,
+        )
+
+    def add_learning(self, query: str, facts: str) -> None:
+        """Store learnings from a query for future reference."""
+        if self._metadata is None:
+            self._compute_metadata()
+        self._metadata.learnings[query] = facts
+
+    def get_learnings(self, limit: int = 5) -> list[dict[str, str]]:
+        """Get recent learnings from this repository."""
+        if self._metadata is None:
+            return []
+        learnings = []
+        for query, finding in list(self._metadata.learnings.items())[:limit]:
+            learnings.append({"query": query, "finding": finding})
+        return learnings
+
+    def get_all_content(self, max_chars: int = 500_000) -> str:
+        """Get all document content concatenated (for small repos)."""
+        files = self.list_files()
+        content_parts = []
+        total_chars = 0
+        for f in files:
+            if total_chars >= max_chars:
+                break
+            try:
+                doc = self.read(f.path)
+                text = doc.full_text
+                content_parts.append(f"\n\n=== {f.filename} ===\n{text}")
+                total_chars += len(text)
+            except Exception as e:
+                logger.warning(f"Failed to read {f.filename}: {e}")
+        return "".join(content_parts)
 
     # === NAVIGATION ===
 

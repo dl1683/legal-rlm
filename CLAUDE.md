@@ -49,18 +49,32 @@ Irys RLM (Recursive Language Model) is a legal document analysis system that inv
 
 ```
 src/irys/
+├── __init__.py           # Public API exports
+├── api.py                # High-level API (Irys class, IrysConfig)
 ├── core/
-│   ├── models.py      # GeminiClient (LITE/FLASH/PRO tiers)
-│   ├── repository.py  # MatterRepository (file discovery)
-│   ├── reader.py      # Document reading (PDF, DOCX, TXT, MHT)
-│   └── search.py      # Text search across documents
+│   ├── models.py         # GeminiClient (LITE/FLASH/PRO tiers, rate limiting)
+│   ├── repository.py     # MatterRepository (file discovery, search)
+│   ├── reader.py         # Document reading (PDF, DOCX, TXT, MHT)
+│   ├── search.py         # DocumentSearch (text search, smart_search)
+│   ├── cache.py          # LRUCache, DiskCache, ResponseCache
+│   ├── clustering.py     # TF-IDF document clustering
+│   ├── external_search.py # CourtListener + Tavily external search
+│   └── utils.py          # Retry logic, telemetry, validation, config
 ├── rlm/
-│   ├── engine.py      # Main investigation engine
-│   ├── decisions.py   # LLM decision functions
-│   ├── prompts.py     # Prompt templates
-│   └── state.py       # InvestigationState, ThinkingStep
+│   ├── engine.py         # RLMEngine (main investigation loop)
+│   ├── decisions.py      # LLM decision functions (organized by tier)
+│   ├── prompts.py        # Prompt templates (organized by tier)
+│   ├── state.py          # InvestigationState, Citation, Lead, Entity
+│   └── templates.py      # Investigation templates (contract, litigation, etc.)
+├── service/
+│   ├── api.py            # FastAPI REST API for S3/cloud deployment
+│   ├── config.py         # ServiceConfig (env-based configuration)
+│   ├── models.py         # Pydantic request/response schemas
+│   └── s3_repository.py  # S3Repository (download, cleanup)
+├── output/
+│   └── formatters.py     # Markdown, HTML, JSON, PlainText formatters
 └── ui/
-    └── app.py         # Streamlit UI
+    └── app.py            # Gradio web UI with real-time streaming
 ```
 
 ## Model Tiers
@@ -126,8 +140,41 @@ python run_ui.py
 
 | Area | File | Purpose |
 |------|------|---------|
-| Search | `src/irys/core/search.py` | Document search logic |
-| Engine | `src/irys/rlm/engine.py` | Investigation loop |
-| Decisions | `src/irys/rlm/decisions.py` | LLM decision functions |
-| Prompts | `src/irys/rlm/prompts.py` | Prompt templates |
-| Reader | `src/irys/core/reader.py` | PDF/DOCX extraction |
+| Search | `src/irys/core/search.py` | Document search logic, smart_search with OR fallback |
+| Engine | `src/irys/rlm/engine.py` | Main investigation loop (Plan → Investigate → Synthesize) |
+| Decisions | `src/irys/rlm/decisions.py` | All LLM decision functions organized by model tier |
+| Prompts | `src/irys/rlm/prompts.py` | All prompt templates organized by tier |
+| Reader | `src/irys/core/reader.py` | PDF/DOCX/TXT/MHT extraction |
+| External | `src/irys/core/external_search.py` | CourtListener (case law) + Tavily (web search) |
+| State | `src/irys/rlm/state.py` | Citation, Lead, Entity, Timeline tracking |
+| API | `src/irys/api.py` | High-level Python API (Irys class) |
+| REST API | `src/irys/service/api.py` | FastAPI REST endpoints for S3/cloud |
+
+## Entry Points
+
+| File | Purpose |
+|------|---------|
+| `run_ui.py` | Launch Gradio UI (port 7862) |
+| `run_server.py` | Launch FastAPI REST server (port 8000) |
+| `quick_test.py` | Quick local testing script |
+
+## External Search Integration
+
+The engine supports external search sources for enriching investigations:
+- **CourtListener**: Legal case law search (requires API token)
+- **Tavily**: Web search for current information (requires API key)
+
+Enable via environment variables:
+```bash
+COURTLISTENER_API_TOKEN=xxx  # Optional: case law search
+TAVILY_API_KEY=xxx           # Optional: web search
+```
+
+## RLMConfig Defaults
+
+Current defaults in `engine.py`:
+- `max_depth`: 3 (reduced from 5 for efficiency)
+- `max_iterations`: 10 (hard limit)
+- `max_leads_per_level`: 5
+- `min_lead_priority`: 0.3
+- `parallel_reads`: 5
