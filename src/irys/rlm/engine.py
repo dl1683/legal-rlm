@@ -985,6 +985,17 @@ Query: {state.query}
                 )
             state.add_facts(facts)
 
+            # Accumulate external research triggers
+            triggers = extraction.get("external_triggers", {})
+            if triggers:
+                added = state.add_triggers(triggers)
+                if added > 0:
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Noted {added} research trigger(s) from {doc.filename}",
+                    )
+
             # Emit insights from the extraction (show LLM's thinking)
             insights = extraction.get("insights", "")
             gaps = extraction.get("gaps", "")
