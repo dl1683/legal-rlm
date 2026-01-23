@@ -833,3 +833,49 @@ async def generate_external_queries(
         "web_queries": [],
         "reasoning": "Unable to parse response",
     }
+
+
+async def extract_triggers_from_content(
+    content: str,
+    client: GeminiClient,
+    max_chars: int = 15000,
+) -> dict:
+    """Extract research triggers from bulk content. Uses LITE model.
+
+    Used in small repo mode where all content is loaded at once.
+    Scans content for jurisdictions, regulations, legal doctrines, etc.
+
+    Args:
+        content: Document content to scan
+        client: GeminiClient instance
+        max_chars: Maximum content chars to process
+
+    Returns:
+        Dict with trigger categories and their values
+    """
+    start_time = time.time()
+    logger.info(f"🔍 extract_triggers_from_content: scanning {len(content)} chars for triggers")
+
+    # Truncate content if needed
+    content_excerpt = content[:max_chars] if len(content) > max_chars else content
+
+    prompt = prompts.P_EXTRACT_TRIGGERS.format(content=content_excerpt)
+
+    _log_llm_call("extract_triggers_from_content", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
+    result = parse_json_safe(response)
+
+    if result:
+        # Count total triggers found
+        total = sum(len(v) for v in result.values() if isinstance(v, list))
+        _log_llm_result("extract_triggers_from_content", f"{total} triggers found", time.time() - start_time)
+        return result
+
+    logger.warning("   JSON parsing failed, returning empty triggers")
+    return {
+        "jurisdictions": [],
+        "regulations_statutes": [],
+        "legal_doctrines": [],
+        "industry_standards": [],
+        "case_references": [],
+    }
