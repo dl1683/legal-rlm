@@ -1,7 +1,7 @@
 """Simple Gradio UI for testing RLM capabilities.
 
 Features:
-- Directory picker
+- Directory picker with native folder browser
 - Query input
 - REAL-TIME thinking display (streams as investigation progresses)
 - Citations panel
@@ -16,6 +16,30 @@ import time
 from pathlib import Path
 from typing import Optional, Generator
 import os
+
+
+def browse_folder() -> str:
+    """Open native folder picker dialog and return selected path."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        # Create hidden root window
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)  # Bring dialog to front
+
+        # Open folder picker
+        folder_path = filedialog.askdirectory(
+            title="Select Document Repository",
+            initialdir=os.path.expanduser("~")
+        )
+
+        root.destroy()
+        return folder_path if folder_path else ""
+    except Exception as e:
+        print(f"Folder picker error: {e}")
+        return ""
 
 from ..core.models import GeminiClient
 from ..rlm.engine import RLMEngine, RLMConfig
@@ -43,7 +67,15 @@ class RLMApp:
     def on_citation(self, citation: Citation):
         """Callback for citations."""
         page_str = f", p. {citation.page}" if citation.page else ""
-        citation_text = f"[{len(self.citations_log) + 1}] {citation.document}{page_str}"
+        # Build full citation with text and context
+        citation_parts = [f"[{len(self.citations_log) + 1}] {citation.document}{page_str}"]
+        if citation.context:
+            citation_parts.append(f"    {citation.context}")
+        if citation.text:
+            # Show full text (truncate only for display if extremely long)
+            text_display = citation.text if len(citation.text) <= 500 else citation.text[:500] + "..."
+            citation_parts.append(f"    Text: {text_display}")
+        citation_text = "\n".join(citation_parts)
         self.citations_log.append(citation_text)
         self.update_queue.put(("citation", citation_text))
 
@@ -190,12 +222,15 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
 
         with gr.Row():
             with gr.Column(scale=2):
-                repo_path = gr.Textbox(
-                    label="Repository Path",
-                    placeholder="Enter path to matter repository...",
-                    info="Full path to the folder containing legal documents",
-                    value=r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
-                )
+                with gr.Row():
+                    repo_path = gr.Textbox(
+                        label="Repository Path",
+                        placeholder="Enter path or click Browse...",
+                        info="Full path to the folder containing legal documents",
+                        value="",
+                        scale=4,
+                    )
+                    browse_btn = gr.Button("📁 Browse", scale=1)
                 query = gr.Textbox(
                     label="Legal Query",
                     placeholder="What would you like to investigate?",
@@ -225,6 +260,13 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                     interactive=False,
                 )
 
+        # Wire up the browse button
+        browse_btn.click(
+            fn=browse_folder,
+            inputs=[],
+            outputs=[repo_path],
+        )
+
         # Wire up the submit button with streaming
         submit_btn.click(
             fn=app.stream_investigation,
@@ -232,23 +274,17 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
             outputs=[output, thinking, citations, status],
         )
 
-        # Example queries
+        # Example queries (click to populate query field)
+        gr.Markdown("### Example Queries (click to use)")
         gr.Examples(
             examples=[
-                [
-                    "What are the key claims in this dispute?",
-                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
-                ],
-                [
-                    "What was the initial cost estimate vs actual cost?",
-                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
-                ],
-                [
-                    "What damages are being claimed and what is the basis?",
-                    r"C:\Users\devan\Downloads\CITIOM v Gulfstream\documents",
-                ],
+                ["What are the key claims in this dispute?"],
+                ["What was the initial cost estimate vs actual cost?"],
+                ["What damages are being claimed and what is the basis?"],
+                ["What is the timeline of events in this case?"],
+                ["Who are the key parties and witnesses?"],
             ],
-            inputs=[query, repo_path],
+            inputs=[query],
         )
 
     return demo

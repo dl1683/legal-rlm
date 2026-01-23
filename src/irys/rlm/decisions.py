@@ -331,6 +331,63 @@ async def should_replan(
     return "replan" in response.lower()
 
 
+# Useless search terms to filter out
+USELESS_TERMS = {
+    # Instruction verbs
+    "analyze", "explain", "describe", "summarize", "find", "identify", "list",
+    "discuss", "compare", "evaluate", "assess", "review", "examine", "determine",
+    "outline", "define", "clarify", "elaborate", "investigate", "explore",
+    # Question words
+    "what", "how", "why", "when", "where", "which", "who", "whom", "whose",
+    # Common words
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
+    "may", "might", "must", "shall", "can", "this", "that", "these", "those",
+    "it", "its", "they", "them", "their", "we", "us", "our", "you", "your",
+    # Generic terms
+    "information", "document", "documents", "data", "work", "thing", "things",
+    "file", "files", "content", "details", "overview", "summary", "analysis",
+    "report", "reports", "item", "items", "point", "points", "aspect", "aspects",
+}
+
+
+def filter_search_terms(terms: list[str]) -> list[str]:
+    """Filter out useless search terms."""
+    filtered = []
+    for term in terms:
+        term_lower = term.lower().strip()
+        # Skip if it's a useless term
+        if term_lower in USELESS_TERMS:
+            continue
+        # Skip if too short (less than 2 chars)
+        if len(term_lower) < 2:
+            continue
+        # Skip if it's just a number
+        if term_lower.isdigit():
+            continue
+        # Skip template-style queries with brackets (e.g., "[specific claim]")
+        if '[' in term or ']' in term:
+            logger.warning(f"Filtering out template-style query: {term}")
+            continue
+        filtered.append(term)
+    return filtered
+
+
+def filter_external_queries(queries: list[str]) -> list[str]:
+    """Filter out template-style external search queries."""
+    filtered = []
+    for query in queries:
+        # Skip template-style queries with brackets
+        if '[' in query or ']' in query:
+            logger.warning(f"Filtering out template-style external query: {query}")
+            continue
+        # Skip empty or too short queries
+        if not query or len(query.strip()) < 5:
+            continue
+        filtered.append(query)
+    return filtered
+
+
 async def extract_search_terms(
     query: str,
     client: GeminiClient,
@@ -339,6 +396,7 @@ async def extract_search_terms(
     prompt = prompts.P_EXTRACT_SEARCH_TERMS.format(query=query)
     response = await client.complete(prompt, tier=ModelTier.LITE)
     terms = extract_list_from_response(response)
+    terms = filter_search_terms(terms)  # Filter out useless terms
     return terms[:10]  # Limit to 10 terms
 
 
@@ -410,16 +468,25 @@ async def create_plan(
     result = parse_json_safe(response)
 
     if result:
+        # Filter out useless search terms
+        if "search_terms" in result:
+            result["search_terms"] = filter_search_terms(result["search_terms"])
+        # Filter out template-style external queries
+        if "case_law_searches" in result:
+            result["case_law_searches"] = filter_external_queries(result["case_law_searches"])
+        if "web_searches" in result:
+            result["web_searches"] = filter_external_queries(result["web_searches"])
         logger.info(f"   Plan: {len(result.get('search_terms', []))} search terms, {len(result.get('priority_files', []))} priority files")
         _log_llm_result("create_plan", result, time.time() - start_time)
         return result
 
-    # Fallback plan
+    # Fallback plan - also filter
     logger.warning("   JSON parsing failed, using fallback plan")
+    fallback_terms = filter_search_terms(query.split()[:5])
     return {
         "key_issues": [query],
         "priority_files": [],
-        "search_terms": query.split()[:5],
+        "search_terms": fallback_terms if fallback_terms else ["document"],
         "success_criteria": "Find information relevant to the query",
     }
 
@@ -531,6 +598,7 @@ async def synthesize(
     evidence: str,
     citations: str,
     client: GeminiClient,
+    external_research: str = "",
 ) -> str:
     """Synthesize final answer. Uses PRO model."""
     start_time = time.time()
@@ -540,6 +608,7 @@ async def synthesize(
     prompt = prompts.P_SYNTHESIZE.format(
         query=query,
         evidence=evidence,
+        external_research=external_research or "No external research conducted.",
         citations=citations,
     )
 
@@ -598,4 +667,103 @@ async def resolve_contradictions(
         "analysis": "Unable to analyze contradictions",
         "resolution": "Present both perspectives",
         "preferred_interpretation": "None",
+    }
+
+
+# =============================================================================
+# EXTERNAL SEARCH DECISIONS
+# =============================================================================
+
+async def should_search_external(
+    query: str,
+    facts_found: list[str],
+    key_issues: list[str],
+    client: GeminiClient,
+) -> dict:
+    """Decide if we should search external sources (case law, web). Uses LITE model."""
+    start_time = time.time()
+    logger.info(f"🌐 should_search_external: evaluating need for external research")
+
+    prompt = prompts.P_SHOULD_SEARCH_EXTERNAL.format(
+        query=query,
+        facts_found="\n".join(f"- {fact}" for fact in facts_found[:15]) if facts_found else "None yet",
+        key_issues="\n".join(f"- {issue}" for issue in key_issues) if key_issues else "None identified",
+    )
+
+    _log_llm_call("should_search_external", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
+    result = parse_json_safe(response)
+
+    if result:
+        _log_llm_result("should_search_external", result, time.time() - start_time)
+        return result
+
+    # Default: search both if query seems legal in nature
+    legal_keywords = ["contract", "damages", "liability", "breach", "negligence", "warranty", "claim"]
+    is_legal = any(kw in query.lower() for kw in legal_keywords)
+
+    return {
+        "search_case_law": is_legal,
+        "case_law_queries": [query] if is_legal else [],
+        "search_web": is_legal,
+        "web_queries": [query] if is_legal else [],
+        "reasoning": "Default behavior based on legal keyword detection",
+    }
+
+
+async def analyze_case_law_results(
+    query: str,
+    case_law_results: str,
+    client: GeminiClient,
+) -> dict:
+    """Analyze case law search results. Uses FLASH model."""
+    start_time = time.time()
+    logger.info(f"⚖️ analyze_case_law_results: extracting legal precedents")
+
+    prompt = prompts.P_ANALYZE_CASE_LAW.format(
+        query=query,
+        case_law_results=case_law_results,
+    )
+
+    _log_llm_call("analyze_case_law_results", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        _log_llm_result("analyze_case_law_results", result, time.time() - start_time)
+        return result
+
+    return {
+        "key_precedents": [],
+        "legal_standards": [],
+        "summary": "Unable to analyze case law results",
+    }
+
+
+async def analyze_web_results(
+    query: str,
+    web_results: str,
+    client: GeminiClient,
+) -> dict:
+    """Analyze web search results for regulations/standards. Uses FLASH model."""
+    start_time = time.time()
+    logger.info(f"🌍 analyze_web_results: extracting regulatory information")
+
+    prompt = prompts.P_ANALYZE_WEB_RESULTS.format(
+        query=query,
+        web_results=web_results,
+    )
+
+    _log_llm_call("analyze_web_results", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        _log_llm_result("analyze_web_results", result, time.time() - start_time)
+        return result
+
+    return {
+        "regulations": [],
+        "standards": [],
+        "summary": "Unable to analyze web results",
     }

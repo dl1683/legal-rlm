@@ -9,9 +9,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from irys.rlm.state import (
     InvestigationState, Citation, Lead, Entity, ThinkingStep, StepType,
-    EvidenceItem, Contradiction, TimelineEvent, CrossReference,
-    RelevanceFeedback, FeedbackType, AnswerQualityAssessment,
-    classify_query, QueryType, get_source_weight, EVIDENCE_SOURCE_WEIGHTS,
+    Contradiction, TimelineEvent, CrossReference,
+    classify_query, QueryType,
 )
 
 

@@ -66,10 +66,17 @@ Reply with only CONTINUE or REPLAN."""
 P_EXTRACT_SEARCH_TERMS = """Query: {query}
 
 Extract 3-5 specific search terms that would help find relevant information in documents.
-Include:
-- Key nouns and phrases from the query
-- Legal/domain-specific terms
-- Names, dates, or specific identifiers mentioned
+
+INCLUDE:
+- Names of people, companies, places
+- Domain-specific terms (legal, technical, industry terms)
+- Specific identifiers (dates, numbers, document names)
+- Key nouns that are the SUBJECT of the query
+
+DO NOT INCLUDE:
+- Instruction verbs (analyze, explain, describe, summarize, find, identify, etc.)
+- Common words (the, what, how, why, when, where, which)
+- Generic terms (information, document, data, work, thing)
 
 Reply with just the search terms, one per line. No explanations."""
 
@@ -139,25 +146,68 @@ Repository structure:
 
 Total files: {total_files}
 
+=== YOUR CAPABILITIES ===
+You have access to THREE search capabilities:
+
+1. LOCAL DOCUMENT SEARCH - Search within the case documents repository
+   - Use for: Case-specific facts, evidence, party communications, exhibits
+   - Best for: Finding what happened in THIS specific case
+
+2. CASE LAW SEARCH (CourtListener) - Search U.S. federal and state court opinions
+   - Use for: Legal precedents, similar cases, judicial interpretations
+   - Best for: Finding how courts have ruled on similar issues
+   - PROACTIVELY use this to support legal arguments and prevent hallucinations
+
+3. WEB SEARCH (Tavily) - Search the web for legal information
+   - Use for: Current regulations, statutes, legal standards, industry norms
+   - Best for: Finding authoritative external legal context
+   - PROACTIVELY use this to verify legal standards and regulations
+
+=== INVESTIGATION STRATEGY ===
+For comprehensive legal research, you should:
+1. Search LOCAL DOCUMENTS for case-specific facts and evidence
+2. Search CASE LAW for relevant precedents when legal issues arise
+3. Search WEB for regulations/standards when compliance or industry norms are relevant
+
 Create a brief investigation plan:
 1. What are the key issues to investigate?
 2. Which files/folders should we search first?
    - For damages/costs: prioritize CLAIMANT briefs and Statements of Claim
    - Always check BOTH party briefs if they exist
-3. What search terms should we use?
-   - Provide individual search terms (1-2 words each) - these work best for grep-style search
-   - Provide OR groups for synonyms/variants (e.g., ["cost", "price", "amount"])
-   - Include document reference patterns (e.g., "GAC", "CIT", "Exhibit") - these often cite actual figures
-   - AVOID long phrases - they often fail to match
-4. What would constitute a sufficient answer?
+3. What search terms should we use for LOCAL documents?
+   - Provide individual search terms (1-2 words each)
+   - Focus on NOUNS: names, places, technical terms, dates
+4. Should we search CASE LAW? For what legal issues?
+5. Should we search the WEB? For what regulations/standards?
+6. What would constitute a sufficient answer?
+
+Share your reasoning:
+- Why are you focusing on these issues?
+- What type of documents are most likely to have the answer?
+- What external legal context (case law, regulations) might strengthen the analysis?
+
+CRITICAL: Generate CONCRETE search queries, NOT templates or placeholders.
+BAD examples (DO NOT USE):
+- "elements of [specific claim]"
+- "defenses to [claim type]"
+- "[subject matter] regulations"
+
+GOOD examples (USE THESE):
+- "breach of warranty elements"
+- "negligent misrepresentation damages"
+- "aircraft maintenance standards FAA"
 
 Reply in JSON:
 {{
+    "reasoning": "Your analysis of the query and why you're taking this approach",
     "key_issues": ["issue1", "issue2"],
     "priority_files": ["file1.pdf", "file2.docx"],
     "search_terms": ["term1", "term2", "term3"],
     "or_groups": [["term1", "synonym1"], ["term2", "variant2", "variant3"]],
-    "success_criteria": "What we need to find to answer the query"
+    "case_law_searches": ["breach of warranty elements", "negligent misrepresentation standard"],
+    "web_searches": ["FAA aircraft maintenance regulations", "aviation industry inspection standards"],
+    "success_criteria": "What we need to find to answer the query",
+    "potential_challenges": "What might make this query difficult to answer"
 }}"""
 
 
@@ -200,17 +250,25 @@ Extract:
 2. Key quotes with page numbers - use VERBATIM text
 3. References to other documents or exhibits
 
+Also provide your analysis:
+- What did you learn from this document that helps answer the query?
+- What gaps remain - what information is still missing?
+- What other documents should we look at based on references here?
+
 Be thorough - missing a single fact or figure could affect the legal outcome.
 
 Reply in JSON:
 {{
     "facts": ["fact1 with exact values", "fact2 with exact values"],
     "quotes": [{{"text": "exact verbatim quote", "page": 1, "relevance": "why important"}}],
-    "references": ["mentioned_doc1.pdf", "mentioned_doc2.pdf"]
+    "references": ["mentioned_doc1.pdf", "mentioned_doc2.pdf"],
+    "insights": "What I learned from this document and how it helps answer the query",
+    "gaps": "What information is still missing or unclear",
+    "next_steps": "What we should look for next based on what we found"
 }}"""
 
 
-P_REPLAN = """The current investigation approach is not working well.
+P_REPLAN = """The current investigation approach needs adjustment.
 
 Query: {query}
 
@@ -218,17 +276,24 @@ What we tried: {previous_approach}
 
 What we found: {findings}
 
-Create a new approach:
-1. What went wrong with the previous approach?
-2. What should we try instead?
-3. What search terms should we use now?
+Reassess and create a new approach:
+1. What's working? What's not working?
+2. What should we try differently?
+3. What new search terms might help?
+4. Are there specific documents we should read?
+5. Do the findings suggest we need EXTERNAL research?
+   - Case law: if we need legal precedents or judicial interpretations
+   - Web search: if we need regulations, statutes, or industry standards
 
 Reply in JSON:
 {{
-    "diagnosis": "What went wrong",
+    "diagnosis": "What's working and what's not",
     "new_approach": "What to try now",
     "search_terms": ["term1", "term2"],
-    "files_to_check": ["file1.pdf"]
+    "files_to_check": ["file1.pdf"],
+    "needs_external_research": true/false,
+    "case_law_searches": ["legal issue to search"],
+    "web_searches": ["regulation or standard to look up"]
 }}"""
 
 
@@ -240,17 +305,27 @@ P_SYNTHESIZE = """You are a senior legal analyst preparing a response to a query
 
 Query: {query}
 
-Evidence gathered:
+=== CASE-SPECIFIC EVIDENCE ===
 {evidence}
 
-Citations:
+=== EXTERNAL LEGAL RESEARCH ===
+{external_research}
+
+=== CITATIONS ===
 {citations}
 
 Write a clear, well-organized response that:
-1. Directly answers the query
-2. Cites specific sources for each claim
-3. Notes any gaps or uncertainties
-4. Is appropriate in length for the complexity of the question
+1. Directly answers the query based on case-specific evidence
+2. Supports legal conclusions with relevant case law and regulations when available
+3. Cites specific sources for each claim (both case documents AND external sources)
+4. Distinguishes between case facts and general legal principles
+5. Notes any gaps or uncertainties
+6. Is appropriate in length for the complexity of the question
+
+When citing:
+- Case documents: [Document Name, p. X]
+- Case law: [Case Name, Citation]
+- Regulations/Web: [Source Name]
 
 Format your response with clear sections if the answer is complex."""
 
@@ -316,4 +391,77 @@ Reply in JSON:
     "action": "search" | "read" | "done",
     "params": {{}},
     "reason": "Brief explanation"
+}}"""
+
+
+# =============================================================================
+# EXTERNAL SEARCH PROMPTS
+# =============================================================================
+
+P_ANALYZE_CASE_LAW = """You found these case law results from CourtListener.
+
+Query context: {query}
+
+Case Law Results:
+{case_law_results}
+
+Extract the key legal principles and precedents:
+1. What legal standards or tests do these cases establish?
+2. How might they apply to the current query?
+3. Are there any directly applicable holdings?
+
+Reply in JSON:
+{{
+    "key_precedents": [
+        {{"case": "Case Name", "citation": "citation", "holding": "relevant holding", "applicability": "how it applies"}}
+    ],
+    "legal_standards": ["standard 1", "standard 2"],
+    "summary": "Brief summary of how this case law informs the query"
+}}"""
+
+
+P_ANALYZE_WEB_RESULTS = """You found these web search results about legal regulations/standards.
+
+Query context: {query}
+
+Web Results:
+{web_results}
+
+Extract the key regulatory information:
+1. What regulations or standards are relevant?
+2. What are the key requirements or thresholds?
+3. How do they apply to the current situation?
+
+Reply in JSON:
+{{
+    "regulations": [
+        {{"name": "Regulation Name", "source": "source URL", "key_requirements": "relevant requirements"}}
+    ],
+    "standards": ["industry standard 1", "legal standard 2"],
+    "summary": "Brief summary of the regulatory context"
+}}"""
+
+
+P_SHOULD_SEARCH_EXTERNAL = """Based on the investigation so far, should we search external sources?
+
+Query: {query}
+
+Facts found so far:
+{facts_found}
+
+Key issues:
+{key_issues}
+
+Consider:
+1. Are there legal issues that would benefit from case law precedents?
+2. Are there regulatory or compliance questions that need external verification?
+3. Would external sources help prevent hallucination about legal standards?
+
+Reply in JSON:
+{{
+    "search_case_law": true/false,
+    "case_law_queries": ["query 1", "query 2"],
+    "search_web": true/false,
+    "web_queries": ["query 1", "query 2"],
+    "reasoning": "Why or why not to search external sources"
 }}"""
