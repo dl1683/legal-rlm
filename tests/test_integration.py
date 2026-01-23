@@ -145,7 +145,7 @@ class TestStateIntegration:
         state = InvestigationState.create("Test query", "/path")
         state.hypothesis = "Test hypothesis"
         state.add_citation("doc.pdf", 1, "Test text", "context", "relevant")
-        state.add_lead("Test lead", "source", 0.8)
+        state.add_lead("Test lead", "source")
         state.add_entity("CITIOM", "company", "doc.pdf")
 
         # Serialize
