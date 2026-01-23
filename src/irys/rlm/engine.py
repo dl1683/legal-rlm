@@ -208,45 +208,46 @@ class RLMEngine:
             f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
         )
 
-        # Determine if external research is needed using consolidated approach
+        # For small repos, skip external search unless explicitly requested in query
+        # (Since we don't go through iterative extraction, we don't accumulate triggers)
         if self.config.enable_external_search and self.external_search:
-            self._emit_step(state, StepType.THINKING, "Analyzing content for external research needs...")
+            # Only do external search if query explicitly asks for it
+            query_lower = state.query.lower()
+            explicit_external = any(term in query_lower for term in [
+                'case law', 'precedent', 'regulation', 'legal standard', 'statute'
+            ])
 
-            # Quick fact extraction from loaded content for context-aware search
-            # Use first ~10K chars to get key entities and facts
-            content_sample = all_content[:10000] if len(all_content) > 10000 else all_content
+            if explicit_external:
+                self._emit_step(state, StepType.THINKING, "Query requests external legal research...")
 
-            # Extract basic facts and entities for the consolidated call
-            quick_facts = []
-            quick_entities = []
+                # Extract entity names from content for context
+                content_sample = all_content[:5000]
+                potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
+                quick_entities = list(set(potential_entities))[:10]
 
-            # Extract party names and key terms from content
-            # Look for capitalized multi-word phrases (likely party names)
-            potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample[:5000])
-            quick_entities = list(set(potential_entities))[:10]
-
-            # Use consolidated LITE call to generate search queries from context
-            result = await decisions.generate_external_queries(
-                query=state.query,
-                facts=quick_facts,  # Empty initially for small repos
-                entities=quick_entities,
-                client=self.client,
-            )
-
-            case_law_queries = result.get("case_law_queries", [])
-            web_queries = result.get("web_queries", [])
-
-            if case_law_queries or web_queries:
-                state.findings["initial_plan"] = {
-                    "case_law_searches": case_law_queries,
-                    "web_searches": web_queries,
-                }
-                self._emit_step(
-                    state,
-                    StepType.THINKING,
-                    f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries",
+                # Use consolidated LITE call with empty triggers (small repo mode)
+                result = await decisions.generate_external_queries(
+                    query=state.query,
+                    facts=[],
+                    entities=quick_entities,
+                    client=self.client,
+                    triggers="",  # No triggers in small repo direct mode
                 )
-                await self._execute_external_searches(state)
+
+                case_law_queries = result.get("case_law_queries", [])
+                web_queries = result.get("web_queries", [])
+
+                if case_law_queries or web_queries:
+                    state.findings["initial_plan"] = {
+                        "case_law_searches": case_law_queries,
+                        "web_searches": web_queries,
+                    }
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries",
+                    )
+                    await self._execute_external_searches(state)
 
         # Compile external research if any and add citations
         external_text = ""
@@ -735,27 +736,41 @@ Query: {state.query}
                 self._save_checkpoint(state, iteration)
 
     async def _check_if_external_needed(self, state: InvestigationState) -> bool:
-        """Check if our findings suggest we need external legal research.
+        """Check if accumulated triggers suggest we need external legal research.
 
-        Uses consolidated LITE call that both:
-        1. Determines if external search is needed
-        2. Generates specific search queries if so
+        Uses trigger-based approach:
+        1. Check if meaningful triggers have been accumulated from documents
+        2. If yes, use LITE to generate specific queries using those triggers
+        3. If no triggers, skip external search entirely (zero LLM cost)
 
         Returns True if queries were generated, False otherwise.
         """
+        # Must have read some documents first
+        if state.documents_read < 2:
+            return False
+
+        # Check if we have meaningful triggers from document analysis
+        if not state.has_external_triggers(min_triggers=2):
+            # No triggers accumulated - skip external search entirely
+            return False
+
         facts = state.findings.get("accumulated_facts", [])
-        if len(facts) < 3:
-            return False  # Not enough context yet
+        entities = [e.name for e in state.entities.values()][:10] if state.entities else []
+        triggers = state.get_trigger_summary()
 
-        # Extract entities from state for more specific queries
-        entities = [e.name for e in state.entities[:10]] if state.entities else []
+        self._emit_step(
+            state,
+            StepType.THINKING,
+            f"Research triggers found: {triggers[:100]}...",
+        )
 
-        # Single consolidated call - generates queries OR returns empty (not needed)
+        # Generate specific queries using accumulated triggers
         result = await decisions.generate_external_queries(
             query=state.query,
             facts=facts,
             entities=entities,
             client=self.client,
+            triggers=triggers,
         )
 
         case_law_queries = result.get("case_law_queries", [])
@@ -771,7 +786,7 @@ Query: {state.query}
             self._emit_step(
                 state,
                 StepType.THINKING,
-                f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from facts",
+                f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
             )
             return True
 
