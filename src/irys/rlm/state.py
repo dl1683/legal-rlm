@@ -317,6 +317,15 @@ class InvestigationState:
     hypothesis: Optional[str] = None
     query_classification: Optional[dict] = None
 
+    # External research triggers (accumulated from document analysis)
+    external_triggers: dict[str, set] = field(default_factory=lambda: {
+        "jurisdictions": set(),
+        "regulations_statutes": set(),
+        "legal_doctrines": set(),
+        "industry_standards": set(),
+        "case_references": set(),
+    })
+
     # Metrics
     documents_read: int = 0
     searches_performed: int = 0
@@ -436,6 +445,58 @@ class InvestigationState:
             if self.add_fact(fact):
                 added += 1
         return added
+
+    def add_triggers(self, triggers: dict[str, list]) -> int:
+        """Accumulate external research triggers from document extraction.
+
+        Args:
+            triggers: Dict with trigger categories as keys and lists of values
+
+        Returns:
+            Number of new triggers added
+        """
+        added = 0
+        for key, values in triggers.items():
+            if key in self.external_triggers and values:
+                for v in values:
+                    if v and v not in self.external_triggers[key]:
+                        self.external_triggers[key].add(v)
+                        added += 1
+        return added
+
+    def has_external_triggers(self, min_triggers: int = 2) -> bool:
+        """Check if we have enough triggers to warrant external search.
+
+        Args:
+            min_triggers: Minimum number of triggers required
+
+        Returns:
+            True if total triggers >= min_triggers
+        """
+        total = sum(len(v) for v in self.external_triggers.values())
+        return total >= min_triggers
+
+    def get_trigger_summary(self) -> str:
+        """Format accumulated triggers for external search query generation.
+
+        Returns:
+            Formatted string of triggers by category
+        """
+        parts = []
+        for key, values in self.external_triggers.items():
+            if values:
+                # Convert set to sorted list for consistent output
+                formatted_key = key.replace("_", " ").title()
+                parts.append(f"{formatted_key}: {', '.join(sorted(values)[:5])}")
+        return "\n".join(parts) if parts else "None identified"
+
+    def get_triggers_for_queries(self) -> dict[str, list]:
+        """Get triggers formatted for query generation.
+
+        Returns:
+            Dict with trigger categories and their values as lists
+        """
+        return {k: list(v) for k, v in self.external_triggers.items() if v}
 
     def add_entity(
         self,
@@ -878,6 +939,7 @@ class InvestigationState:
             "findings": self.findings,
             "hypothesis": self.hypothesis,
             "query_classification": self.query_classification,
+            "external_triggers": {k: list(v) for k, v in self.external_triggers.items()},
             "documents_read": self.documents_read,
             "searches_performed": self.searches_performed,
             "recursion_depth": self.recursion_depth,
@@ -987,6 +1049,13 @@ class InvestigationState:
         state.findings = data.get("findings", {})
         state.hypothesis = data.get("hypothesis")
         state.query_classification = data.get("query_classification")
+
+        # Restore external triggers (convert lists back to sets)
+        if "external_triggers" in data:
+            for key, values in data["external_triggers"].items():
+                if key in state.external_triggers:
+                    state.external_triggers[key] = set(values) if values else set()
+
         state.documents_read = data.get("documents_read", 0)
         state.searches_performed = data.get("searches_performed", 0)
         state.recursion_depth = data.get("recursion_depth", 0)
