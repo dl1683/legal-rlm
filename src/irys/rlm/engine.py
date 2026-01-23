@@ -208,30 +208,40 @@ class RLMEngine:
             f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
         )
 
-        # For small repos, skip external search unless explicitly requested in query
-        # (Since we don't go through iterative extraction, we don't accumulate triggers)
+        # For small repos, do a quick trigger extraction before deciding on external search
         if self.config.enable_external_search and self.external_search:
-            # Only do external search if query explicitly asks for it
-            query_lower = state.query.lower()
-            explicit_external = any(term in query_lower for term in [
-                'case law', 'precedent', 'regulation', 'legal standard', 'statute'
-            ])
+            self._emit_step(state, StepType.THINKING, "Scanning content for research triggers...")
 
-            if explicit_external:
-                self._emit_step(state, StepType.THINKING, "Query requests external legal research...")
+            # Quick LITE call to extract triggers from loaded content
+            triggers_result = await decisions.extract_triggers_from_content(
+                content=all_content,
+                client=self.client,
+            )
+
+            # Accumulate triggers into state
+            state.add_triggers(triggers_result)
+
+            # Check if meaningful triggers were found
+            if state.has_external_triggers(min_triggers=2):
+                triggers_summary = state.get_trigger_summary()
+                self._emit_step(
+                    state,
+                    StepType.THINKING,
+                    f"Research triggers found: {triggers_summary[:100]}...",
+                )
 
                 # Extract entity names from content for context
                 content_sample = all_content[:5000]
                 potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
                 quick_entities = list(set(potential_entities))[:10]
 
-                # Use consolidated LITE call with empty triggers (small repo mode)
+                # Generate specific queries using triggers
                 result = await decisions.generate_external_queries(
                     query=state.query,
                     facts=[],
                     entities=quick_entities,
                     client=self.client,
-                    triggers="",  # No triggers in small repo direct mode
+                    triggers=triggers_summary,
                 )
 
                 case_law_queries = result.get("case_law_queries", [])
@@ -245,7 +255,7 @@ class RLMEngine:
                     self._emit_step(
                         state,
                         StepType.THINKING,
-                        f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries",
+                        f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
                     )
                     await self._execute_external_searches(state)
 
