@@ -767,3 +767,64 @@ async def analyze_web_results(
         "standards": [],
         "summary": "Unable to analyze web results",
     }
+
+
+async def generate_external_queries(
+    query: str,
+    facts: list[str],
+    entities: list[str],
+    client: GeminiClient,
+) -> dict:
+    """Generate external search queries from accumulated facts. Uses LITE model.
+
+    This is a CONSOLIDATED function that replaces the two-step approach of:
+    1. "Should we search external?"
+    2. "What should we search for?"
+
+    Instead, in one call, LITE analyzes the facts and either:
+    - Returns specific search queries (meaning external search IS needed)
+    - Returns empty lists (meaning no external search needed)
+
+    Args:
+        query: The user's original query
+        facts: Facts accumulated from document analysis
+        entities: Entities identified (party names, legal terms, etc.)
+        client: GeminiClient instance
+
+    Returns:
+        Dict with case_law_queries, web_queries, and reasoning
+    """
+    start_time = time.time()
+    logger.info(f"🔍 generate_external_queries: analyzing {len(facts)} facts for external search needs")
+
+    # Format facts and entities
+    facts_text = "\n".join(f"- {fact}" for fact in facts[:15]) if facts else "No facts gathered yet"
+    entities_text = "\n".join(f"- {entity}" for entity in entities[:10]) if entities else "None identified"
+
+    prompt = prompts.P_GENERATE_EXTERNAL_QUERIES.format(
+        query=query,
+        facts=facts_text,
+        entities=entities_text,
+    )
+
+    _log_llm_call("generate_external_queries", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
+    result = parse_json_safe(response)
+
+    if result:
+        # Filter out any template-style queries that slipped through
+        if "case_law_queries" in result:
+            result["case_law_queries"] = filter_external_queries(result.get("case_law_queries", []))
+        if "web_queries" in result:
+            result["web_queries"] = filter_external_queries(result.get("web_queries", []))
+
+        total_queries = len(result.get("case_law_queries", [])) + len(result.get("web_queries", []))
+        _log_llm_result("generate_external_queries", f"{total_queries} queries generated", time.time() - start_time)
+        return result
+
+    logger.warning("   JSON parsing failed, returning no external queries")
+    return {
+        "case_law_queries": [],
+        "web_queries": [],
+        "reasoning": "Unable to parse response",
+    }
