@@ -145,18 +145,13 @@ class RLMEngine:
                 # Mimics how a lawyer works:
 
                 # Phase 1: Create investigation plan based on the query and repo structure
-                # The plan may or may not include external searches depending on the query
                 await self._create_plan(state, repo)
 
-                # Phase 1.5: Execute external searches IF the plan calls for them
-                # (Not mandatory - only if the LLM determined they're needed upfront)
-                if self.config.enable_external_search and self.external_search:
-                    await self._execute_external_searches(state)
-
                 # Phase 2: Investigation loop with continuous recalibration
-                # - Reads documents, extracts facts
+                # - Reads documents, extracts facts, accumulates research triggers
                 # - Continuously checks: sufficient? need to replan? need external research?
-                # - Dynamically triggers external search if findings reveal the need
+                # - External search is triggered MID-LOOP after triggers are accumulated
+                #   (not upfront with generic terms - that produced irrelevant results)
                 await self._investigate_loop(state, repo, cache)
 
                 # Phase 3: Final synthesis
