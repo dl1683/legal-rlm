@@ -490,37 +490,44 @@ Facts found from documents:
 Entities identified:
 {entities}
 
-Based on these facts, generate SPECIFIC external search queries that would:
-1. Find relevant case law precedents for legal issues mentioned
-2. Find regulations/standards that apply to the situation
+Research triggers identified from documents:
+{triggers}
+
+Based on the facts AND the research triggers, generate SPECIFIC external search queries.
+
+HOW TO USE TRIGGERS:
+- If jurisdictions found (e.g., "Michigan") → search that jurisdiction's case law
+- If regulations found (e.g., "FAA Part 91") → search for that specific regulation
+- If legal doctrines found (e.g., "breach of warranty") → search for precedent on that doctrine
+- If industry standards found → search for those specific standards
+- If case references found → search for those specific cases
 
 RULES:
-- Only generate queries if there are CLEAR gaps that external research would fill
-- Use SPECIFIC names, legal terms, and entities from the facts
-- NO generic templates like "[specific claim]" - use actual terms
-- Return EMPTY lists if the facts are sufficient on their own
+- PRIORITIZE triggers - they tell you exactly what to search for
+- Combine triggers with entities for specific queries (e.g., "Michigan breach of warranty aircraft")
+- Only generate queries if triggers or facts suggest external research would help
+- Return EMPTY lists if no meaningful triggers exist and facts are sufficient
 
-GOOD examples:
-- "breach of warranty aircraft maintenance"
-- "Gulfstream damages fraud misrepresentation"
-- "FAA inspection requirements 192 month"
-- "aviation contract consequential damages"
+GOOD examples (using triggers + entities):
+- "Michigan breach of warranty aircraft maintenance" (jurisdiction + doctrine + industry)
+- "FAA Part 91 inspection requirements G550" (regulation + specific aircraft)
+- "Gulfstream negligent misrepresentation damages" (entity + doctrine)
 
 BAD examples (DO NOT USE):
-- "breach of contract cases"
-- "aviation regulations"
-- "damages case law"
+- "breach of contract cases" (too generic)
+- "aviation regulations" (too generic)
+- "damages case law" (too generic)
 
 Reply in JSON only:
 {{
     "case_law_queries": ["specific query 1", "specific query 2"],
     "web_queries": ["specific regulation query"],
-    "reasoning": "Brief explanation of why these searches are needed"
+    "reasoning": "Brief explanation of which triggers informed these searches"
 }}
 
-If no external research is needed, reply:
+If no external research is needed (no meaningful triggers, facts sufficient), reply:
 {{
     "case_law_queries": [],
     "web_queries": [],
-    "reasoning": "Facts are sufficient to answer the query"
+    "reasoning": "No meaningful triggers found; facts are sufficient"
 }}"""
