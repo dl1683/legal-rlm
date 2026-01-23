@@ -465,3 +465,49 @@ Reply in JSON:
     "web_queries": ["query 1", "query 2"],
     "reasoning": "Why or why not to search external sources"
 }}"""
+
+
+P_GENERATE_EXTERNAL_QUERIES = """You are analyzing case facts to determine if external legal research is needed.
+
+Query: {query}
+
+Facts found from documents:
+{facts}
+
+Entities identified:
+{entities}
+
+Based on these facts, generate SPECIFIC external search queries that would:
+1. Find relevant case law precedents for legal issues mentioned
+2. Find regulations/standards that apply to the situation
+
+RULES:
+- Only generate queries if there are CLEAR gaps that external research would fill
+- Use SPECIFIC names, legal terms, and entities from the facts
+- NO generic templates like "[specific claim]" - use actual terms
+- Return EMPTY lists if the facts are sufficient on their own
+
+GOOD examples:
+- "breach of warranty aircraft maintenance"
+- "Gulfstream damages fraud misrepresentation"
+- "FAA inspection requirements 192 month"
+- "aviation contract consequential damages"
+
+BAD examples (DO NOT USE):
+- "breach of contract cases"
+- "aviation regulations"
+- "damages case law"
+
+Reply in JSON only:
+{{
+    "case_law_queries": ["specific query 1", "specific query 2"],
+    "web_queries": ["specific regulation query"],
+    "reasoning": "Brief explanation of why these searches are needed"
+}}
+
+If no external research is needed, reply:
+{{
+    "case_law_queries": [],
+    "web_queries": [],
+    "reasoning": "Facts are sufficient to answer the query"
+}}"""
