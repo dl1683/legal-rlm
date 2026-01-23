@@ -531,3 +531,28 @@ If no external research is needed (no meaningful triggers, facts sufficient), re
     "web_queries": [],
     "reasoning": "No meaningful triggers found; facts are sufficient"
 }}"""
+
+
+P_EXTRACT_TRIGGERS = """Scan this legal document content and identify any external research triggers.
+
+Content (excerpt):
+{content}
+
+Identify mentions of:
+1. Jurisdictions - specific courts, states, countries, or legal systems mentioned
+2. Regulations/Statutes - specific laws, codes, regulations, or statutory references
+3. Legal doctrines - legal theories, causes of action, or legal principles
+4. Industry standards - technical standards, professional practices, certifications
+5. Case references - any cited cases or legal precedents
+
+Only include SPECIFIC items actually mentioned in the text. Do NOT infer or guess.
+Return empty lists for categories with no mentions.
+
+Reply in JSON only:
+{{
+    "jurisdictions": ["specific jurisdictions mentioned"],
+    "regulations_statutes": ["specific regulations or statutes cited"],
+    "legal_doctrines": ["specific legal doctrines referenced"],
+    "industry_standards": ["specific standards mentioned"],
+    "case_references": ["specific cases cited"]
+}}"""
