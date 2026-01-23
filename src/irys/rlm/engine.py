@@ -12,6 +12,7 @@ from typing import Optional, Callable, Any
 from pathlib import Path
 import asyncio
 import logging
+import re
 
 from ..core.models import GeminiClient, ModelTier
 from ..core.repository import MatterRepository
@@ -207,65 +208,45 @@ class RLMEngine:
             f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
         )
 
-        # Determine if external research is needed
+        # Determine if external research is needed using consolidated approach
         if self.config.enable_external_search and self.external_search:
-            query_lower = state.query.lower()
+            self._emit_step(state, StepType.THINKING, "Analyzing content for external research needs...")
 
-            # Explicit triggers - if query mentions these, ALWAYS search externally
-            explicit_case_law = any(term in query_lower for term in [
-                'case law', 'precedent', 'court ruling', 'judicial', 'legal standard'
-            ])
-            explicit_regulations = any(term in query_lower for term in [
-                'regulation', 'regulatory', 'statute', 'compliance', 'legal requirement',
-                'guidance', 'law on', 'laws on', 'legal framework'
-            ])
+            # Quick fact extraction from loaded content for context-aware search
+            # Use first ~10K chars to get key entities and facts
+            content_sample = all_content[:10000] if len(all_content) > 10000 else all_content
 
-            if explicit_case_law or explicit_regulations:
-                self._emit_step(state, StepType.THINKING, "Query requests external legal research...")
+            # Extract basic facts and entities for the consolidated call
+            quick_facts = []
+            quick_entities = []
 
-                # Extract search terms from query
+            # Extract party names and key terms from content
+            # Look for capitalized multi-word phrases (likely party names)
+            potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample[:5000])
+            quick_entities = list(set(potential_entities))[:10]
+
+            # Use consolidated LITE call to generate search queries from context
+            result = await decisions.generate_external_queries(
+                query=state.query,
+                facts=quick_facts,  # Empty initially for small repos
+                entities=quick_entities,
+                client=self.client,
+            )
+
+            case_law_queries = result.get("case_law_queries", [])
+            web_queries = result.get("web_queries", [])
+
+            if case_law_queries or web_queries:
                 state.findings["initial_plan"] = {
-                    "case_law_searches": [state.query] if explicit_case_law else [],
-                    "web_searches": [state.query] if explicit_regulations else [],
+                    "case_law_searches": case_law_queries,
+                    "web_searches": web_queries,
                 }
-
-                # Execute external searches
-                await self._execute_external_searches(state)
-            else:
-                # Quick LLM check for implicit needs
-                self._emit_step(state, StepType.THINKING, "Checking if external research needed...")
-
-                plan_response = await self.client.complete(
-                    f"""Query: {state.query}
-
-Does this query need external legal research beyond what's in the documents?
-- Case law: if asking about legal precedents, how courts have ruled, legal standards
-- Web: if asking about regulations, statutes, compliance, industry standards
-
-Reply ONLY in this JSON format:
-{{"needs_case_law": true, "case_law_query": "search terms"}} or {{"needs_case_law": false}}
-{{"needs_web": true, "web_query": "search terms"}} or {{"needs_web": false}}""",
-                    tier=ModelTier.LITE,
+                self._emit_step(
+                    state,
+                    StepType.THINKING,
+                    f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries",
                 )
-
-                try:
-                    import json
-                    # Handle potential multiple JSON objects
-                    plan_response = plan_response.replace('\n', ' ').replace('}{', ', ')
-                    if not plan_response.strip().startswith('{'):
-                        plan_response = '{' + plan_response.split('{', 1)[-1]
-                    plan = json.loads(plan_response.split('}')[0] + '}')
-
-                    state.findings["initial_plan"] = {
-                        "case_law_searches": [plan.get("case_law_query", state.query)] if plan.get("needs_case_law") else [],
-                        "web_searches": [plan.get("web_query", state.query)] if plan.get("needs_web") else [],
-                    }
-
-                    if plan.get("needs_case_law") or plan.get("needs_web"):
-                        await self._execute_external_searches(state)
-                except Exception as e:
-                    logger.warning(f"External search planning failed: {e}")
-                    pass
+                await self._execute_external_searches(state)
 
         # Compile external research if any and add citations
         external_text = ""
@@ -756,70 +737,45 @@ Query: {state.query}
     async def _check_if_external_needed(self, state: InvestigationState) -> bool:
         """Check if our findings suggest we need external legal research.
 
-        Triggers external search when we discover:
-        - References to case law or legal precedents
-        - Mentions of regulations, statutes, or compliance requirements
-        - State-specific legal requirements
-        - Industry standards that need verification
+        Uses consolidated LITE call that both:
+        1. Determines if external search is needed
+        2. Generates specific search queries if so
+
+        Returns True if queries were generated, False otherwise.
         """
         facts = state.findings.get("accumulated_facts", [])
         if len(facts) < 3:
             return False  # Not enough context yet
 
-        # Check with LLM if external research would help
-        facts_sample = "\n".join(f"- {f}" for f in facts[:10])
+        # Extract entities from state for more specific queries
+        entities = [e.name for e in state.entities[:10]] if state.entities else []
 
-        response = await self.client.complete(
-            f"""Based on these findings from document review, do we need external legal research?
-
-Query: {state.query}
-
-Facts found so far:
-{facts_sample}
-
-External research is needed if the findings reveal:
-- References to case law or legal precedents that should be verified
-- Regulations, statutes, or compliance requirements to look up
-- State-specific legal requirements (e.g., "Michigan law", "California regulations")
-- Industry standards that need external verification
-- Legal claims that need precedent support
-
-Reply with only YES or NO.""",
-            tier=ModelTier.LITE,
+        # Single consolidated call - generates queries OR returns empty (not needed)
+        result = await decisions.generate_external_queries(
+            query=state.query,
+            facts=facts,
+            entities=entities,
+            client=self.client,
         )
 
-        needs_it = "yes" in response.lower()
-        if needs_it:
-            # Also ask what to search for
-            search_response = await self.client.complete(
-                f"""What external legal research would help answer this query?
+        case_law_queries = result.get("case_law_queries", [])
+        web_queries = result.get("web_queries", [])
 
-Query: {state.query}
+        # If any queries were generated, store them for execution
+        if case_law_queries or web_queries:
+            if "initial_plan" not in state.findings:
+                state.findings["initial_plan"] = {}
+            state.findings["initial_plan"]["case_law_searches"] = case_law_queries
+            state.findings["initial_plan"]["web_searches"] = web_queries
 
-Facts found:
-{facts_sample}
-
-Suggest 1-2 specific searches:
-- For case law: what legal issue to search
-- For regulations: what standard/regulation to look up
-
-Reply in JSON:
-{{"case_law_searches": ["search 1"], "web_searches": ["search 1"]}}""",
-                tier=ModelTier.LITE,
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from facts",
             )
+            return True
 
-            # Parse and store in plan for _execute_external_searches to use
-            try:
-                import json
-                searches = json.loads(search_response)
-                if "initial_plan" not in state.findings:
-                    state.findings["initial_plan"] = {}
-                state.findings["initial_plan"]["case_law_searches"] = searches.get("case_law_searches", [])
-                state.findings["initial_plan"]["web_searches"] = searches.get("web_searches", [])
-            except:
-                pass
-
-        return needs_it
+        return False
 
     async def _investigate_lead(
         self,
