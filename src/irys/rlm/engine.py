@@ -50,7 +50,8 @@ class RLMConfig:
 @dataclass
 class InvestigationCache:
     """Cache to avoid redundant work."""
-    extracted_docs: set = field(default_factory=set)  # Docs we've extracted facts from
+    extracted_docs: set = field(
+        default_factory=set)  # Docs we've extracted facts from
     searched_terms: set = field(default_factory=set)  # Search terms we've used
 
     def has_extracted(self, filepath: str) -> bool:
@@ -70,7 +71,8 @@ class InvestigationCache:
             existing_words = set(existing.lower().split())
             # If >50% word overlap, consider it similar
             if term_words and existing_words:
-                overlap = len(term_words & existing_words) / min(len(term_words), len(existing_words))
+                overlap = len(term_words & existing_words) / \
+                    min(len(term_words), len(existing_words))
                 if overlap > 0.5:
                     return True
         return False
@@ -105,7 +107,8 @@ class RLMEngine:
         self.on_citation = on_citation
         self.on_progress = on_progress
         # Initialize external search manager (enabled by default)
-        self.external_search = ExternalSearchManager() if self.config.enable_external_search else None
+        self.external_search = ExternalSearchManager(
+        ) if self.config.enable_external_search else None
         self._external_research: dict = {}  # Store external research results
 
     async def investigate(
@@ -117,6 +120,13 @@ class RLMEngine:
         repo = MatterRepository(repository_path)
         state = InvestigationState.create(query, str(repository_path))
         cache = InvestigationCache()
+
+        # Adapt configuration based on repository size
+        stats = repo.get_stats()
+        self._adapt_config_for_repo_size(stats.total_files)
+
+        # Reset semaphore for new investigation
+        self._operation_semaphore = None
 
         # Classify the query
         state.query_classification = classify_query(query)
@@ -210,7 +220,8 @@ class RLMEngine:
 
         # For small repos, do a quick trigger extraction before deciding on external search
         if self.config.enable_external_search and self.external_search:
-            self._emit_step(state, StepType.THINKING, "Scanning content for research triggers...")
+            self._emit_step(state, StepType.THINKING,
+                            "Scanning content for research triggers...")
 
             # Quick LITE call to extract triggers from loaded content
             triggers_result = await decisions.extract_triggers_from_content(
@@ -232,7 +243,8 @@ class RLMEngine:
 
                 # Extract entity names from content for context
                 content_sample = all_content[:5000]
-                potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
+                potential_entities = re.findall(
+                    r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
                 quick_entities = list(set(potential_entities))[:10]
 
                 # Generate specific queries using triggers
@@ -358,7 +370,8 @@ Query: {state.query}
         if case_law:
             case_lines = []
             for c in case_law[:5]:
-                snippet = c.get('snippet') or c.get('opinion_text') or 'No snippet available'
+                snippet = c.get('snippet') or c.get(
+                    'opinion_text') or 'No snippet available'
                 case_lines.append(
                     f"- **{c.get('case_name', 'Unknown')}** ({c.get('citation') or 'No citation'})\n"
                     f"  Court: {c.get('court', 'Unknown')} | Date: {c.get('date_filed', 'Unknown')}\n"
@@ -367,7 +380,8 @@ Query: {state.query}
             result["case_law"] = "\n\n".join(case_lines)
 
             # Include analysis if available
-            analysis = self._external_research.get("analysis", {}).get("case_law", {})
+            analysis = self._external_research.get(
+                "analysis", {}).get("case_law", {})
             if analysis:
                 summary = analysis.get("summary", "")
                 if summary:
@@ -390,7 +404,8 @@ Query: {state.query}
                 result["web"] = f"**Summary:** {self._external_research['web_answer']}\n\n" + result["web"]
 
             # Include analysis if available
-            analysis = self._external_research.get("analysis", {}).get("web", {})
+            analysis = self._external_research.get(
+                "analysis", {}).get("web", {})
             if analysis:
                 summary = analysis.get("summary", "")
                 if summary:
@@ -400,11 +415,13 @@ Query: {state.query}
 
     async def _create_plan(self, state: InvestigationState, repo: MatterRepository):
         """Phase 1: Create investigation plan using LLM."""
-        self._emit_step(state, StepType.THINKING, "Analyzing repository structure...")
+        self._emit_step(state, StepType.THINKING,
+                        "Analyzing repository structure...")
 
         stats = repo.get_stats()
         structure = repo.get_structure()
-        structure_str = "\n".join(f"  {folder}: {count} files" for folder, count in structure.items())
+        structure_str = "\n".join(
+            f"  {folder}: {count} files" for folder, count in structure.items())
 
         # Use decisions layer for planning
         plan = await decisions.create_plan(
@@ -515,7 +532,8 @@ Query: {state.query}
                             f"Found {len(cases)} relevant cases for '{query[:30]}...'",
                         )
                 except Exception as e:
-                    logger.warning(f"Case law search failed for '{query}': {e}")
+                    logger.warning(
+                        f"Case law search failed for '{query}': {e}")
 
             # Analyze case law results (results are dicts from to_dict())
             if self._external_research["case_law"]:
@@ -586,7 +604,8 @@ Query: {state.query}
                 citation = state.add_citation(
                     document=f"[Case Law] {case.get('case_name', 'Unknown Case')}",
                     page=None,
-                    text=case.get('snippet', '') or case.get('opinion_text', '') or '',
+                    text=case.get('snippet', '') or case.get(
+                        'opinion_text', '') or '',
                     context=f"Citation: {case.get('citation', 'N/A')} | Court: {case.get('court', 'N/A')}",
                     relevance="External case law research",
                 )
@@ -627,7 +646,8 @@ Query: {state.query}
 
             pending_leads = state.get_pending_leads()
             if not pending_leads:
-                self._emit_step(state, StepType.THINKING, "No more leads to investigate")
+                self._emit_step(state, StepType.THINKING,
+                                "No more leads to investigate")
                 break
 
             # Take leads to process
@@ -640,7 +660,8 @@ Query: {state.query}
             )
 
             # Process leads in parallel
-            tasks = [self._investigate_lead(state, repo, lead, cache) for lead in leads_to_process]
+            tasks = [self._investigate_lead(
+                state, repo, lead, cache) for lead in leads_to_process]
             await asyncio.gather(*tasks, return_exceptions=True)
 
             iteration += 1
@@ -678,10 +699,12 @@ Query: {state.query}
             # - Every 2 iterations for simpler queries
             is_complex = state.query_classification.get('complexity', 3) >= 3
             is_stalled = facts_delta < 2 and iteration > 1
-            should_check_replan = is_stalled or (is_complex and iteration > 0) or (iteration > 1 and iteration % 2 == 0)
+            should_check_replan = is_stalled or (is_complex and iteration > 0) or (
+                iteration > 1 and iteration % 2 == 0)
 
             if should_check_replan and pending_leads:  # Only replan if we still have work to do
-                plan_summary = state.findings.get("initial_plan", {}).get("reasoning", "")
+                plan_summary = state.findings.get(
+                    "initial_plan", {}).get("reasoning", "")
                 should_change = await decisions.should_replan(
                     query=state.query,
                     plan=plan_summary,
@@ -706,11 +729,13 @@ Query: {state.query}
                     new_leads_added = 0
                     for term in new_plan.get("search_terms", [])[:3]:
                         if not cache.is_similar_search(term):
-                            state.add_lead(f"Search for: {term}", source="replan")
+                            state.add_lead(
+                                f"Search for: {term}", source="replan")
                             new_leads_added += 1
                     for filepath in new_plan.get("files_to_check", [])[:2]:
                         if not cache.has_extracted(filepath):
-                            state.add_lead(f"Read document: {filepath}", source="replan")
+                            state.add_lead(
+                                f"Read document: {filepath}", source="replan")
                             new_leads_added += 1
 
                     if new_leads_added > 0:
@@ -724,8 +749,10 @@ Query: {state.query}
                     if new_plan.get("needs_external_research") and not external_search_triggered:
                         if "initial_plan" not in state.findings:
                             state.findings["initial_plan"] = {}
-                        state.findings["initial_plan"]["case_law_searches"] = new_plan.get("case_law_searches", [])
-                        state.findings["initial_plan"]["web_searches"] = new_plan.get("web_searches", [])
+                        state.findings["initial_plan"]["case_law_searches"] = new_plan.get(
+                            "case_law_searches", [])
+                        state.findings["initial_plan"]["web_searches"] = new_plan.get(
+                            "web_searches", [])
 
             # 3. Dynamic external search - trigger if we discover we need it
             # (e.g., found references to case law, regulations, state-specific rules)
@@ -765,7 +792,8 @@ Query: {state.query}
             return False
 
         facts = state.findings.get("accumulated_facts", [])
-        entities = [e.name for e in state.entities.values()][:10] if state.entities else []
+        entities = [e.name for e in state.entities.values()
+                    ][:10] if state.entities else []
         triggers = state.get_trigger_summary()
 
         self._emit_step(
@@ -834,12 +862,14 @@ Query: {state.query}
 
             # OPTIMIZATION: Skip similar searches
             if self.config.skip_similar_searches and cache.is_similar_search(search_term):
-                state.mark_lead_investigated(lead.id, f"Similar search already done")
+                state.mark_lead_investigated(
+                    lead.id, f"Similar search already done")
                 logger.info(f"Skipping similar search: {search_term}")
                 return
 
             cache.add_search(search_term)
-            self._emit_step(state, StepType.SEARCH, f"Searching: {search_term}")
+            self._emit_step(state, StepType.SEARCH,
+                            f"Searching: {search_term}")
 
             # Perform search (using smart_search for OR fallback)
             results = repo.smart_search(search_term, context_lines=2)
@@ -858,7 +888,8 @@ Query: {state.query}
             # OPTIMIZATION: Skip LLM call if <= 15 results (long-context LLMs handle this fine)
             if len(results.hits) <= 15:
                 relevant_hits = results.hits
-                logger.info(f"Skipping pick_relevant_hits: only {len(results.hits)} results")
+                logger.info(
+                    f"Skipping pick_relevant_hits: only {len(results.hits)} results")
             else:
                 # Let LLM pick the most relevant hits
                 relevant_hits = await decisions.pick_relevant_hits(
@@ -869,8 +900,8 @@ Query: {state.query}
 
             # Analyze results and read docs (with caching)
             await self._analyze_results(state, repo, results, relevant_hits, cache)
-
-            state.mark_lead_investigated(lead.id, f"Found {len(results.hits)} matches")
+            state.mark_lead_investigated(
+                lead.id, f"Found {len(results.hits)} matches")
 
     async def _analyze_results(
         self,
@@ -931,7 +962,8 @@ Query: {state.query}
             )
 
             # Filter to unread files only
-            top_files = [f for f in prioritized_files if not cache.has_extracted(f)]
+            top_files = [
+                f for f in prioritized_files if not cache.has_extracted(f)]
         else:
             top_files = []
 
@@ -973,7 +1005,8 @@ Query: {state.query}
             logger.debug(f"Skipping already extracted: {file_path}")
             return
 
-        self._emit_step(state, StepType.READING, f"Reading: {Path(file_path).name}")
+        self._emit_step(state, StepType.READING,
+                        f"Reading: {Path(file_path).name}")
 
         try:
             doc = repo.read(file_path)
@@ -989,7 +1022,8 @@ Query: {state.query}
             content = doc.get_excerpt(excerpt_limit)
 
             # Dynamic extraction limit (matching excerpt)
-            extraction_limit = 10000 if getattr(self, '_is_simple_query', False) else 35000
+            extraction_limit = 10000 if getattr(
+                self, '_is_simple_query', False) else 35000
 
             # Use decisions layer to extract facts
             extraction = await decisions.extract_facts(
@@ -1052,7 +1086,8 @@ Query: {state.query}
             # Skip adding reference leads - reduces iteration depth
 
         except Exception as e:
-            self._emit_step(state, StepType.ERROR, f"Failed to read {file_path}: {e}")
+            self._emit_step(state, StepType.ERROR,
+                            f"Failed to read {file_path}: {e}")
 
     async def _synthesize(self, state: InvestigationState, is_simple: bool = False):
         """Phase 3: Final synthesis using ALL THREE sources.
@@ -1062,7 +1097,8 @@ Query: {state.query}
         2. Case law search (CourtListener)
         3. Web search (Tavily - regulations/standards)
         """
-        self._emit_step(state, StepType.SYNTHESIS, "Synthesizing from all sources...")
+        self._emit_step(state, StepType.SYNTHESIS,
+                        "Synthesizing from all sources...")
 
         # SOURCE 1: Local document evidence
         facts = state.findings.get("accumulated_facts", [])
@@ -1075,7 +1111,8 @@ Query: {state.query}
         web_text = external_formatted.get("web", "No web results found")
 
         # Track sources used
-        state.findings["sources_used"] = ["local_documents", "case_law", "web_search"]
+        state.findings["sources_used"] = [
+            "local_documents", "case_law", "web_search"]
 
         # OPTIMIZATION: Use FLASH for simple queries
         if is_simple and self.config.use_flash_for_simple:
@@ -1097,7 +1134,8 @@ Query: {state.query}
             )
 
         state.findings["final_output"] = response
-        self._emit_step(state, StepType.SYNTHESIS, "Analysis complete (3 sources: docs, case law, web)")
+        self._emit_step(state, StepType.SYNTHESIS,
+                        "Analysis complete (3 sources: docs, case law, web)")
 
     def _emit_step(
         self,
@@ -1130,7 +1168,8 @@ Query: {state.query}
                 break
 
         # Clean up
-        term = re.sub(r'\bAND\b|\bOR\b|\bNOT\b', ' ', term, flags=re.IGNORECASE)
+        term = re.sub(r'\bAND\b|\bOR\b|\bNOT\b',
+                      ' ', term, flags=re.IGNORECASE)
         term = re.sub(r'[\'\"()]', ' ', term)
         term = re.sub(r'\s+', ' ', term).strip()
 
@@ -1162,7 +1201,8 @@ Query: {state.query}
         if not self.config.checkpoint_dir:
             return
 
-        checkpoint_path = Path(self.config.checkpoint_dir) / f"checkpoint_{state.id}_iter{iteration}.json"
+        checkpoint_path = Path(self.config.checkpoint_dir) / \
+            f"checkpoint_{state.id}_iter{iteration}.json"
         state.save_checkpoint(checkpoint_path)
         logger.info(f"Saved checkpoint: {checkpoint_path}")
 
@@ -1175,7 +1215,8 @@ Query: {state.query}
         repo = MatterRepository(state.repository_path)
         cache = InvestigationCache()
 
-        self._emit_step(state, StepType.THINKING, "Resuming investigation from checkpoint")
+        self._emit_step(state, StepType.THINKING,
+                        "Resuming investigation from checkpoint")
 
         try:
             if state.status not in ("completed", "failed"):

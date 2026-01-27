@@ -349,6 +349,7 @@ class MatterRepository:
         regex: bool = False,
         case_sensitive: bool = False,
         context_lines: int = 2,
+        max_workers: Optional[int] = None,
     ) -> SearchResults:
         """
         Search for query across all documents.
@@ -360,6 +361,7 @@ class MatterRepository:
             regex: Treat query as regex
             case_sensitive: Case sensitive matching
             context_lines: Lines of context around matches
+            max_workers: Max parallel workers for search (default scales with file count)
 
         Returns:
             SearchResults with all matches
@@ -372,12 +374,17 @@ class MatterRepository:
 
         files = [f.path for f in self.list_files(pattern, file_types)]
 
+        # Scale workers based on file count if not specified
+        if max_workers is None:
+            max_workers = min(10, max(1, len(files)))
+
         return self.search_engine.search(
             query=query,
             files=files,
             regex=regex,
             case_sensitive=case_sensitive,
             context_lines=context_lines,
+            max_workers=max_workers,
         )
 
     def smart_search(

@@ -43,6 +43,9 @@ class ServiceConfig:
     log_level: str = "INFO"
     log_format: str = "json"  # json or text
 
+    # Storage mode: "local" for dev (files on disk), "s3" for production (stream to S3)
+    storage_mode: str = "s3"
+
     @classmethod
     def from_env(cls) -> "ServiceConfig":
         """Load configuration from environment variables."""
@@ -73,6 +76,8 @@ class ServiceConfig:
             # Logging
             log_level=os.getenv("IRYS_LOG_LEVEL", "INFO"),
             log_format=os.getenv("IRYS_LOG_FORMAT", "json"),
+            # Storage mode
+            storage_mode=os.getenv("IRYS_STORAGE_MODE", "s3"),
         )
 
     def validate(self) -> list[str]:

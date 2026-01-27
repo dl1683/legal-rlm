@@ -68,7 +68,7 @@ class JobResult(BaseModel):
     # Results (only when completed)
     analysis: Optional[str] = None
     citations: Optional[list[dict[str, Any]]] = None
-    entities: Optional[dict[str, list[str]]] = None
+    entities: Optional[dict[str, Any]] = None
     documents_processed: int = 0
     error: Optional[str] = None
 
@@ -112,4 +112,102 @@ class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
     code: Optional[str] = None
+
+
+# === File Upload Models ===
+
+
+class UploadInvestigateResponse(BaseModel):
+    """Response from file upload investigation."""
+    job_id: str = Field(..., description="Unique job identifier")
+    status: JobStatus = Field(..., description="Current job status")
+    message: str = Field(..., description="Status message")
+    files_received: int = Field(..., description="Number of files uploaded")
+    estimated_seconds: Optional[int] = Field(
+        None, description="Estimated completion time"
+    )
+
+
+class UploadSearchResponse(BaseModel):
+    """Response from file upload search."""
+    results: list[SearchResult]
+    total_matches: int
+    files_searched: int
+
+
+class SyncInvestigateResponse(BaseModel):
+    """Response from synchronous investigation."""
+    query: str
+    analysis: str
+    citations: list[dict[str, Any]] = []
+    entities: dict[str, Any] = {}
+    documents_processed: int
+    duration_seconds: float
+    s3_prefix: Optional[str] = Field(None, description="S3 prefix if files were kept")
+
+
+# === S3 URL Models ===
+
+
+class UrlWithMetadata(BaseModel):
+    """URL with optional metadata for file type detection."""
+    url: str = Field(..., description="Document URL")
+    name: Optional[str] = Field(None, description="Original filename (e.g., 'Contract.pdf')")
+    mime: Optional[str] = Field(None, description="MIME type (e.g., 'application/pdf')")
+
+
+# Type alias for URL input - can be string or object with metadata
+UrlInput = str | UrlWithMetadata
+
+
+class S3UrlsInvestigateRequest(BaseModel):
+    """Request to investigate documents by URLs (S3 or HTTP)."""
+    query: str = Field(..., description="Investigation query")
+    s3_urls: list[UrlInput] = Field(
+        ...,
+        description=(
+            "List of document URLs. Each item can be a string URL or an object with "
+            "'url', 'name' (filename), and 'mime' (MIME type) fields. "
+            "Supports S3 URLs and generic HTTP(S) URLs including presigned URLs."
+        ),
+        min_length=1,
+        max_length=50,
+    )
+    callback_url: Optional[str] = Field(
+        None, description="URL to POST results when complete"
+    )
+    options: Optional[dict[str, Any]] = Field(
+        default_factory=dict, description="Additional investigation options"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "What are the key payment terms and obligations?",
+                "s3_urls": [
+                    "s3://my-bucket/contracts/main_contract.pdf",
+                    {
+                        "url": "https://bucket.s3.amazonaws.com/abc123?X-Amz-Signature=...",
+                        "name": "Contract.pdf",
+                        "mime": "application/pdf"
+                    },
+                ],
+                "callback_url": "https://your-service.com/webhook/investigation",
+            }
+        }
+
+
+class S3UrlsSearchRequest(BaseModel):
+    """Request for quick search by URLs (S3 or HTTP)."""
+    query: str = Field(..., description="Search query")
+    s3_urls: list[UrlInput] = Field(
+        ...,
+        description=(
+            "List of document URLs. Each item can be a string URL or an object with "
+            "'url', 'name' (filename), and 'mime' (MIME type) fields."
+        ),
+        min_length=1,
+        max_length=50,
+    )
+    max_results: int = Field(20, ge=1, le=100, description="Maximum results")
 
