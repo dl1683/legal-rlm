@@ -133,7 +133,7 @@ class RLMApp:
         """Save uploaded files to local temp directory.
 
         Args:
-            files: List of (filename, content) tuples
+            files: List of (relative_path, content) tuples - path can include subdirectories
             session_id: Unique session identifier
 
         Returns:
@@ -142,8 +142,10 @@ class RLMApp:
         temp_dir = Path(self.config.temp_dir) / session_id
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        for filename, content in files:
-            file_path = temp_dir / filename
+        for relative_path, content in files:
+            file_path = temp_dir / relative_path
+            # Create parent directories if they don't exist (for folder uploads)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_bytes(content)
             logger.debug(f"Saved file: {file_path}")
 
@@ -241,18 +243,81 @@ class RLMApp:
 
         asyncio.run(_run())
 
+    def _extract_files_from_upload(
+        self,
+        uploaded_files: list,
+    ) -> tuple[list[tuple[str, bytes]], str | None]:
+        """Extract files from Gradio upload, preserving folder structure.
+
+        Args:
+            uploaded_files: List of Gradio file objects (can be files or folder contents)
+
+        Returns:
+            Tuple of (list of (relative_path, content) tuples, error message or None)
+        """
+        if not uploaded_files:
+            return [], None
+
+        files: list[tuple[str, bytes]] = []
+
+        # Find common prefix to determine folder structure
+        # When uploading a folder, Gradio preserves the path structure
+        all_paths = [Path(f.name) for f in uploaded_files]
+
+        # Check if this looks like a folder upload (paths have common parent structure)
+        # Folder uploads typically have paths like: /tmp/gradio/.../folder_name/subdir/file.pdf
+        common_prefix = None
+        if len(all_paths) > 1:
+            # Find the common ancestor directory
+            try:
+                common_prefix = Path(os.path.commonpath([str(p) for p in all_paths]))
+            except ValueError:
+                # No common path (different drives on Windows, etc.)
+                common_prefix = None
+
+        for file in uploaded_files:
+            try:
+                file_path = Path(file.name)
+
+                # Determine relative path for folder structure preservation
+                if common_prefix and common_prefix != file_path:
+                    # This is a folder upload - preserve structure relative to common prefix
+                    relative_path = file_path.relative_to(common_prefix)
+                else:
+                    # Single file or no common structure - just use filename
+                    relative_path = Path(file_path.name)
+
+                # Skip hidden files and system files
+                if any(part.startswith('.') for part in relative_path.parts):
+                    logger.debug(f"Skipping hidden file: {relative_path}")
+                    continue
+
+                with open(file.name, "rb") as f:
+                    content = f.read()
+
+                files.append((str(relative_path), content))
+                logger.debug(f"Extracted file: {relative_path}")
+
+            except Exception as e:
+                logger.error(f"Error reading file {file.name}: {e}")
+                return [], f"Error reading file {file.name}: {e}"
+
+        return files, None
+
     def stream_investigation_with_upload(
         self,
         query: str,
         uploaded_files: list,
+        uploaded_folder: list = None,
     ) -> Generator[tuple, None, None]:
         """
-        Generator that streams investigation with uploaded files.
+        Generator that streams investigation with uploaded files/folders.
         Yields: (output, thinking_trace, citations, status)
 
         Args:
             query: The investigation query
-            uploaded_files: List of Gradio file objects
+            uploaded_files: List of Gradio file objects from file upload
+            uploaded_folder: List of Gradio file objects from folder upload
         """
         self.thinking_log = []
         self.citations_log = []
@@ -260,26 +325,30 @@ class RLMApp:
         self.error_msg = ""
         self.update_queue = queue.Queue()
 
-        if not uploaded_files:
-            yield ("", "", "", "Error: Please upload at least one document")
+        # Combine files from both upload sources
+        all_uploaded = []
+        if uploaded_files:
+            all_uploaded.extend(uploaded_files)
+        if uploaded_folder:
+            all_uploaded.extend(uploaded_folder)
+
+        if not all_uploaded:
+            yield ("", "", "", "Error: Please upload files or a folder")
             return
 
         if not query.strip():
             yield ("", "", "", "Error: Please enter a query")
             return
 
-        # Convert Gradio files to (filename, bytes) tuples
-        files: list[tuple[str, bytes]] = []
-        for file in uploaded_files:
-            try:
-                filename = Path(file.name).name
-                with open(file.name, "rb") as f:
-                    content = f.read()
-                files.append((filename, content))
-            except Exception as e:
-                logger.error(f"Error reading file {file.name}: {e}")
-                yield ("", "", "", f"Error reading file: {e}")
-                return
+        # Extract files preserving folder structure
+        files, error = self._extract_files_from_upload(all_uploaded)
+        if error:
+            yield ("", "", "", f"Error: {error}")
+            return
+
+        if not files:
+            yield ("", "", "", "Error: No valid files found in upload")
+            return
 
         session_id = self._generate_session_id()
         logger.info(f"Starting investigation session {session_id} with {len(files)} files")
@@ -449,16 +518,28 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                         )
                         browse_btn = gr.Button("Browse", scale=1)
                 else:
-                    # Cloud mode: file upload
-                    file_upload = gr.File(
-                        label="Upload Documents",
-                        file_count="multiple",
-                        file_types=[".pdf", ".docx", ".doc", ".txt", ".rtf", ".mht"],
-                        type="filepath",
-                    )
-                    gr.Markdown(
-                        "*Supported formats: PDF, DOCX, DOC, TXT, RTF, MHT*",
-                    )
+                    # Cloud mode: file upload AND folder upload
+                    with gr.Tabs():
+                        with gr.TabItem("Upload Files"):
+                            file_upload = gr.File(
+                                label="Upload Individual Documents",
+                                file_count="multiple",
+                                file_types=[".pdf", ".docx", ".doc", ".txt", ".rtf", ".mht"],
+                                type="filepath",
+                            )
+                            gr.Markdown(
+                                "*Select one or more files. Supported formats: PDF, DOCX, DOC, TXT, RTF, MHT*",
+                            )
+                        with gr.TabItem("Upload Folder"):
+                            folder_upload = gr.File(
+                                label="Upload Document Folder",
+                                file_count="directory",
+                                type="filepath",
+                            )
+                            gr.Markdown(
+                                "*Select a folder to upload all documents including subfolders. "
+                                "Folder structure will be preserved.*",
+                            )
 
                 query = gr.Textbox(
                     label="Legal Query",
@@ -503,10 +584,10 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                 outputs=[output, thinking, citations, status],
             )
         else:
-            # Cloud mode: file upload
+            # Cloud mode: file upload and folder upload
             submit_btn.click(
                 fn=app.stream_investigation_with_upload,
-                inputs=[query, file_upload],
+                inputs=[query, file_upload, folder_upload],
                 outputs=[output, thinking, citations, status],
             )
 
