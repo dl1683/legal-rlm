@@ -111,6 +111,34 @@ class RLMEngine:
         ) if self.config.enable_external_search else None
         self._external_research: dict = {}  # Store external research results
 
+    def _adapt_config_for_repo_size(self, total_files: int) -> None:
+        """Adapt configuration based on repository size.
+
+        Small repos can use more aggressive settings.
+        Large repos need conservative settings to avoid timeouts.
+        """
+        if total_files <= 10:
+            # Very small repo - can be aggressive
+            self.config.max_leads_per_level = 5
+            self.config.parallel_reads = 5
+            self.config.max_documents_per_search = 10
+        elif total_files <= 50:
+            # Medium repo - balanced settings
+            self.config.max_leads_per_level = 4
+            self.config.parallel_reads = 4
+            self.config.max_documents_per_search = 7
+        elif total_files <= 200:
+            # Large repo - conservative
+            self.config.max_leads_per_level = 3
+            self.config.parallel_reads = 3
+            self.config.max_documents_per_search = 5
+        else:
+            # Very large repo - very conservative
+            self.config.max_leads_per_level = 2
+            self.config.parallel_reads = 2
+            self.config.max_documents_per_search = 3
+            self.config.max_depth = 2
+
     async def investigate(
         self,
         query: str,

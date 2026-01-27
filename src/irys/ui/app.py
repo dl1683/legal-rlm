@@ -1,7 +1,8 @@
 """Simple Gradio UI for testing RLM capabilities.
 
 Features:
-- Directory picker with native folder browser
+- Directory picker with native folder browser (local mode)
+- File upload with S3 storage (cloud mode)
 - Query input
 - REAL-TIME thinking display (streams as investigation progresses)
 - Citations panel
@@ -13,9 +14,23 @@ import asyncio
 import threading
 import queue
 import time
+import uuid
+import logging
 from pathlib import Path
 from typing import Optional, Generator
 import os
+
+from ..core.models import GeminiClient
+from ..rlm.engine import RLMEngine, RLMConfig
+from ..rlm.state import InvestigationState, ThinkingStep, Citation, StepType
+from ..service.config import ServiceConfig
+
+logger = logging.getLogger(__name__)
+
+
+def get_storage_mode() -> str:
+    """Get storage mode from environment."""
+    return os.getenv("IRYS_STORAGE_MODE", "local")
 
 
 def browse_folder() -> str:
@@ -41,16 +56,14 @@ def browse_folder() -> str:
         print(f"Folder picker error: {e}")
         return ""
 
-from ..core.models import GeminiClient
-from ..rlm.engine import RLMEngine, RLMConfig
-from ..rlm.state import InvestigationState, ThinkingStep, Citation, StepType
-
 
 class RLMApp:
     """Gradio application wrapper for RLM with real-time streaming."""
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, config: Optional[ServiceConfig] = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self.config = config or ServiceConfig.from_env()
+        self.storage_mode = get_storage_mode()
         self.current_state: Optional[InvestigationState] = None
         self.thinking_log: list[str] = []
         self.citations_log: list[str] = []
@@ -58,6 +71,94 @@ class RLMApp:
         self.is_running = False
         self.final_output = ""
         self.error_msg = ""
+        self._temp_dirs: dict[str, Path] = {}  # Track temp dirs for cleanup
+
+    def _generate_session_id(self) -> str:
+        """Generate a unique session/job ID."""
+        return f"ui_{uuid.uuid4().hex[:12]}"
+
+    async def _upload_files_to_s3(
+        self,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+    ) -> str:
+        """Upload files to S3 and return the S3 prefix.
+
+        Args:
+            files: List of (filename, content) tuples
+            session_id: Unique session identifier
+
+        Returns:
+            S3 prefix where files were uploaded
+        """
+        from ..service.s3_repository import S3Repository
+
+        s3_repo = S3Repository(
+            bucket=self.config.s3_bucket,
+            config=self.config,
+        )
+
+        prefix = await s3_repo.upload_files(session_id, files)
+        logger.info(f"Uploaded {len(files)} files to S3: {prefix}")
+        return prefix
+
+    async def _download_s3_to_temp(self, s3_prefix: str, session_id: str) -> Path:
+        """Download files from S3 prefix to temp directory for processing.
+
+        Args:
+            s3_prefix: S3 prefix containing the files
+            session_id: Session ID for temp dir naming
+
+        Returns:
+            Path to temp directory with downloaded files
+        """
+        from ..service.s3_repository import S3Repository
+
+        s3_repo = S3Repository(
+            bucket=self.config.s3_bucket,
+            prefix=s3_prefix,
+            config=self.config,
+        )
+
+        temp_dir = await s3_repo.download_to_temp(session_id)
+        self._temp_dirs[session_id] = temp_dir
+        logger.info(f"Downloaded S3 files to temp: {temp_dir}")
+        return temp_dir
+
+    def _save_files_to_temp(
+        self,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+    ) -> Path:
+        """Save uploaded files to local temp directory.
+
+        Args:
+            files: List of (filename, content) tuples
+            session_id: Unique session identifier
+
+        Returns:
+            Path to temp directory with files
+        """
+        temp_dir = Path(self.config.temp_dir) / session_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        for filename, content in files:
+            file_path = temp_dir / filename
+            file_path.write_bytes(content)
+            logger.debug(f"Saved file: {file_path}")
+
+        self._temp_dirs[session_id] = temp_dir
+        logger.info(f"Saved {len(files)} files to temp: {temp_dir}")
+        return temp_dir
+
+    def _cleanup_session(self, session_id: str) -> None:
+        """Clean up temp directory for a session."""
+        if session_id in self._temp_dirs:
+            import shutil
+            temp_dir = self._temp_dirs.pop(session_id)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temp directory: {temp_dir}")
 
     def on_thinking_step(self, step: ThinkingStep):
         """Callback for thinking steps - pushes to queue for real-time updates."""
@@ -100,6 +201,100 @@ class RLMApp:
 
         asyncio.run(_run())
 
+    def run_investigation_with_upload_async(
+        self,
+        query: str,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+    ):
+        """Run investigation with uploaded files in background thread."""
+        async def _run():
+            repo_path = None
+            try:
+                # Handle file storage based on mode
+                if self.storage_mode != "local":
+                    # S3 mode: upload files then download to temp
+                    s3_prefix = await self._upload_files_to_s3(files, session_id)
+                    repo_path = await self._download_s3_to_temp(s3_prefix, session_id)
+                else:
+                    # Local mode: save directly to temp
+                    repo_path = self._save_files_to_temp(files, session_id)
+
+                # Run investigation
+                client = GeminiClient(api_key=self.api_key)
+                engine = RLMEngine(
+                    gemini_client=client,
+                    config=RLMConfig(),
+                    on_step=self.on_thinking_step,
+                    on_citation=self.on_citation,
+                )
+                state = await engine.investigate(query, str(repo_path))
+                self.current_state = state
+                self.final_output = state.findings.get("final_output", "No output generated")
+                self.update_queue.put(("complete", state))
+            except Exception as e:
+                self.error_msg = str(e)
+                self.update_queue.put(("error", str(e)))
+            finally:
+                # Cleanup temp directory
+                self._cleanup_session(session_id)
+
+        asyncio.run(_run())
+
+    def stream_investigation_with_upload(
+        self,
+        query: str,
+        uploaded_files: list,
+    ) -> Generator[tuple, None, None]:
+        """
+        Generator that streams investigation with uploaded files.
+        Yields: (output, thinking_trace, citations, status)
+
+        Args:
+            query: The investigation query
+            uploaded_files: List of Gradio file objects
+        """
+        self.thinking_log = []
+        self.citations_log = []
+        self.final_output = ""
+        self.error_msg = ""
+        self.update_queue = queue.Queue()
+
+        if not uploaded_files:
+            yield ("", "", "", "Error: Please upload at least one document")
+            return
+
+        if not query.strip():
+            yield ("", "", "", "Error: Please enter a query")
+            return
+
+        # Convert Gradio files to (filename, bytes) tuples
+        files: list[tuple[str, bytes]] = []
+        for file in uploaded_files:
+            try:
+                filename = Path(file.name).name
+                with open(file.name, "rb") as f:
+                    content = f.read()
+                files.append((filename, content))
+            except Exception as e:
+                logger.error(f"Error reading file {file.name}: {e}")
+                yield ("", "", "", f"Error reading file: {e}")
+                return
+
+        session_id = self._generate_session_id()
+        logger.info(f"Starting investigation session {session_id} with {len(files)} files")
+
+        # Start investigation in background thread
+        self.is_running = True
+        thread = threading.Thread(
+            target=self.run_investigation_with_upload_async,
+            args=(query, files, session_id)
+        )
+        thread.start()
+
+        # Use the common streaming loop
+        yield from self._stream_updates(thread)
+
     def stream_investigation(
         self,
         query: str,
@@ -130,6 +325,12 @@ class RLMApp:
             args=(query, repo_path)
         )
         thread.start()
+
+        # Use the common streaming loop
+        yield from self._stream_updates(thread)
+
+    def _stream_updates(self, thread: threading.Thread) -> Generator[tuple, None, None]:
+        """Common streaming loop for investigation updates."""
 
         start_time = time.time()
 
@@ -208,29 +409,57 @@ class RLMApp:
 
 
 def create_app(api_key: Optional[str] = None) -> gr.Blocks:
-    """Create the Gradio application with real-time streaming."""
+    """Create the Gradio application with real-time streaming.
+
+    The UI adapts based on IRYS_STORAGE_MODE:
+    - "local": Shows folder browser for local file system
+    - "s3" or other: Shows file upload component for cloud storage
+    """
     app = RLMApp(api_key=api_key)
+    storage_mode = get_storage_mode()
+    is_local_mode = storage_mode == "local"
 
     with gr.Blocks(
         title="Irys RLM - Legal Document Analysis",
     ) as demo:
         gr.Markdown("# Irys RLM - Recursive Legal Document Analysis")
-        gr.Markdown(
-            "Select a matter repository and ask a legal question. "
-            "**Watch the thinking trace update in real-time as the system investigates!**"
-        )
+
+        if is_local_mode:
+            gr.Markdown(
+                "Select a matter repository and ask a legal question. "
+                "**Watch the thinking trace update in real-time as the system investigates!**"
+            )
+        else:
+            gr.Markdown(
+                "Upload your legal documents and ask a question. "
+                "**Watch the thinking trace update in real-time as the system investigates!**"
+            )
 
         with gr.Row():
             with gr.Column(scale=2):
-                with gr.Row():
-                    repo_path = gr.Textbox(
-                        label="Repository Path",
-                        placeholder="Enter path or click Browse...",
-                        info="Full path to the folder containing legal documents",
-                        value="",
-                        scale=4,
+                if is_local_mode:
+                    # Local mode: folder browser
+                    with gr.Row():
+                        repo_path = gr.Textbox(
+                            label="Repository Path",
+                            placeholder="Enter path or click Browse...",
+                            info="Full path to the folder containing legal documents",
+                            value="",
+                            scale=4,
+                        )
+                        browse_btn = gr.Button("Browse", scale=1)
+                else:
+                    # Cloud mode: file upload
+                    file_upload = gr.File(
+                        label="Upload Documents",
+                        file_count="multiple",
+                        file_types=[".pdf", ".docx", ".doc", ".txt", ".rtf", ".mht"],
+                        type="filepath",
                     )
-                    browse_btn = gr.Button("📁 Browse", scale=1)
+                    gr.Markdown(
+                        "*Supported formats: PDF, DOCX, DOC, TXT, RTF, MHT*",
+                    )
+
                 query = gr.Textbox(
                     label="Legal Query",
                     placeholder="What would you like to investigate?",
@@ -260,19 +489,26 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                     interactive=False,
                 )
 
-        # Wire up the browse button
-        browse_btn.click(
-            fn=browse_folder,
-            inputs=[],
-            outputs=[repo_path],
-        )
-
-        # Wire up the submit button with streaming
-        submit_btn.click(
-            fn=app.stream_investigation,
-            inputs=[query, repo_path],
-            outputs=[output, thinking, citations, status],
-        )
+        # Wire up buttons based on mode
+        if is_local_mode:
+            # Local mode: folder browser
+            browse_btn.click(
+                fn=browse_folder,
+                inputs=[],
+                outputs=[repo_path],
+            )
+            submit_btn.click(
+                fn=app.stream_investigation,
+                inputs=[query, repo_path],
+                outputs=[output, thinking, citations, status],
+            )
+        else:
+            # Cloud mode: file upload
+            submit_btn.click(
+                fn=app.stream_investigation_with_upload,
+                inputs=[query, file_upload],
+                outputs=[output, thinking, citations, status],
+            )
 
         # Example queries (click to populate query field)
         gr.Markdown("### Example Queries (click to use)")
@@ -298,14 +534,54 @@ def main():
     parser.add_argument("--api-key", help="Gemini API key")
     parser.add_argument("--port", type=int, default=7860, help="Port to run on")
     parser.add_argument("--share", action="store_true", help="Create public link")
+    parser.add_argument(
+        "--server-name",
+        default="0.0.0.0",
+        help="Server hostname to bind to (default: 0.0.0.0 for all interfaces)",
+    )
+    parser.add_argument(
+        "--ssl-certfile",
+        help="Path to SSL certificate file for HTTPS",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        help="Path to SSL key file for HTTPS",
+    )
+    parser.add_argument(
+        "--root-path",
+        default="",
+        help="Root path for reverse proxy setups (e.g., /app)",
+    )
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("Warning: No GEMINI_API_KEY provided")
 
+    storage_mode = get_storage_mode()
+    print(f"[INFO] Storage mode: {storage_mode}")
+
     app = create_app(api_key=api_key)
-    app.launch(server_port=args.port, share=args.share)
+
+    # Build launch kwargs
+    launch_kwargs = {
+        "server_port": args.port,
+        "server_name": args.server_name,
+        "share": args.share,
+    }
+
+    # Add SSL if provided
+    if args.ssl_certfile and args.ssl_keyfile:
+        launch_kwargs["ssl_certfile"] = args.ssl_certfile
+        launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
+        print(f"[INFO] SSL enabled with cert: {args.ssl_certfile}")
+
+    # Add root path for reverse proxy
+    if args.root_path:
+        launch_kwargs["root_path"] = args.root_path
+        print(f"[INFO] Root path: {args.root_path}")
+
+    app.launch(**launch_kwargs)
 
 
 if __name__ == "__main__":

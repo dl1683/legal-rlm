@@ -14,6 +14,7 @@ from typing import Optional
 import aiofiles
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 import httpx
 
 from .config import ServiceConfig, get_config
@@ -116,6 +117,18 @@ def create_app(config: Optional[ServiceConfig] = None) -> FastAPI:
     # Store config in app state
     app.state.config = config
 
+    # Mount Gradio UI at /ui path (root path would override API routes)
+    try:
+        import gradio as gr
+        from ..ui.app import create_app as create_gradio_app
+        gradio_app = create_gradio_app(api_key=config.gemini_api_key)
+        app = gr.mount_gradio_app(app, gradio_app, path="/ui")
+        logger.info("Gradio UI mounted at /ui")
+    except ImportError as e:
+        logger.warning(f"Gradio not available, UI disabled: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to mount Gradio UI: {e}")
+
     return app
 
 
@@ -149,6 +162,12 @@ def _serialize_result(result) -> tuple[list, dict]:
 
 
 # === ENDPOINTS ===
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    """Redirect root to Gradio UI."""
+    return RedirectResponse(url="/ui")
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
