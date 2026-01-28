@@ -1,8 +1,8 @@
 """LLM decision functions for the investigation engine.
 
 All LLM-based decisions are made here. Functions are organized by model tier:
-- WORKER (LITE): Quick decisions, file picking, sufficiency checks
-- MID (FLASH): Analysis, planning, fact extraction
+- WORKER (LITE): Quick decisions, file picking, sufficiency checks, fact extraction
+- MID (FLASH): Strategic analysis, planning, replanning
 - HIGH (PRO): Final synthesis only
 
 Each function takes a GeminiClient and returns structured data.
@@ -118,6 +118,35 @@ def extract_list_from_response(text: str) -> list[str]:
             items.append(line)
 
     return items
+
+
+def _coerce_bool(value: any) -> bool:
+    """Coerce a value to boolean, handling string representations.
+
+    LLMs sometimes return "true"/"false" as strings instead of JSON booleans.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "1")
+    return bool(value)
+
+
+def _coerce_int(value: any) -> int | None:
+    """Coerce a value to int, handling string representations.
+
+    LLMs sometimes return numbers as strings.
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    if isinstance(value, float):
+        return int(value)
+    return None
 
 
 # =============================================================================
@@ -530,7 +559,7 @@ async def extract_facts(
     client: GeminiClient,
     max_content_chars: int = 35000,  # Increased for full legal doc coverage
 ) -> dict:
-    """Extract facts from a document. Uses FLASH model."""
+    """Extract facts from a document. Uses LITE model for cost efficiency."""
     start_time = time.time()
     logger.info(f"📄 extract_facts: extracting from '{filename}' ({len(content)} chars)")
 
@@ -545,8 +574,8 @@ async def extract_facts(
         content=content,
     )
 
-    _log_llm_call("extract_facts", ModelTier.FLASH, prompt, start_time)
-    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    _log_llm_call("extract_facts", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
     result = parse_json_safe(response)
 
     if result:
@@ -878,4 +907,150 @@ async def extract_triggers_from_content(
         "legal_doctrines": [],
         "industry_standards": [],
         "case_references": [],
+    }
+
+
+# =============================================================================
+# CONSOLIDATED FUNCTIONS (Reducing LLM calls)
+# =============================================================================
+
+async def checkpoint(
+    query: str,
+    findings: str,
+    plan: str,
+    client: GeminiClient,
+) -> dict:
+    """Combined sufficiency + replan check. Uses LITE model.
+
+    Consolidates is_sufficient + should_replan into one call.
+    Returns: {sufficient, should_replan, progress_assessment, next_steps, new_search_terms, files_to_check}
+    """
+    start_time = time.time()
+    logger.info(f"🔍 checkpoint: evaluating investigation status")
+
+    prompt = prompts.P_CHECKPOINT.format(
+        query=query,
+        findings=findings,
+        plan=plan,
+    )
+
+    _log_llm_call("checkpoint", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
+    result = parse_json_safe(response)
+
+    if result:
+        # Coerce boolean fields to handle string values from LLM
+        result["sufficient"] = _coerce_bool(result.get("sufficient", False))
+        result["should_replan"] = _coerce_bool(result.get("should_replan", False))
+        _log_llm_result("checkpoint", result, time.time() - start_time)
+        return result
+
+    # Fallback: not sufficient, should replan
+    logger.warning("   JSON parsing failed, returning default checkpoint")
+    return {
+        "sufficient": False,
+        "should_replan": True,
+        "progress_assessment": "Unable to assess",
+        "next_steps": [],
+        "new_search_terms": [],
+        "files_to_check": [],
+    }
+
+
+async def analyze_search(
+    query: str,
+    key_issues: list[str],
+    results,  # SearchResults object
+    already_read: list[str],
+    client: GeminiClient,
+) -> dict:
+    """Combined search analysis. Uses FLASH model for strategic decisions.
+
+    Consolidates pick_relevant_hits + analyze_results + prioritize_documents into one call.
+    Returns: {relevant_hit_numbers, facts, citations, ranked_documents, additional_searches, read_deeper}
+    """
+    start_time = time.time()
+    logger.info(f"🔍 analyze_search: combined analysis of {len(results.hits)} hits")
+
+    # Format results for the prompt
+    results_text = []
+    for i, hit in enumerate(results.hits[:30], 1):  # Limit to 30 hits
+        context = hit.context[:200] if hit.context else ""
+        results_text.append(f"[{i}] {hit.file_path} (p.{hit.page_num}): {hit.match_text[:100]}... Context: {context}")
+
+    prompt = prompts.P_ANALYZE_SEARCH.format(
+        query=query,
+        key_issues="\n".join(f"- {issue}" for issue in key_issues) if key_issues else "None identified yet",
+        results="\n".join(results_text),
+        already_read="\n".join(already_read) if already_read else "None",
+    )
+
+    _log_llm_call("analyze_search", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        # Extract relevant hits based on numbers returned (coerce strings to ints)
+        hit_numbers = result.get("relevant_hit_numbers", [])
+        relevant_hits = []
+        for num in hit_numbers:
+            coerced = _coerce_int(num)
+            if coerced is not None and 1 <= coerced <= len(results.hits):
+                relevant_hits.append(results.hits[coerced - 1])
+        result["relevant_hits"] = relevant_hits
+
+        _log_llm_result("analyze_search", f"{len(relevant_hits)} hits, {len(result.get('ranked_documents', []))} docs ranked", time.time() - start_time)
+        return result
+
+    # Fallback: return first few results to avoid stalling investigation
+    logger.warning("   JSON parsing failed, using fallback (first 5 hits)")
+    fallback_hits = results.hits[:5] if results.hits else []
+    fallback_docs = list(set(hit.file_path for hit in fallback_hits))[:3]
+    return {
+        "relevant_hit_numbers": list(range(1, min(6, len(results.hits) + 1))),
+        "relevant_hits": fallback_hits,
+        "facts": [],
+        "citations": [],
+        "ranked_documents": [{"file": f, "score": 50, "criticality": "SUPPORTING"} for f in fallback_docs],
+        "additional_searches": [],
+        "read_deeper": fallback_docs,
+    }
+
+
+async def analyze_external(
+    query: str,
+    case_law_results: str,
+    web_results: str,
+    client: GeminiClient,
+) -> dict:
+    """Combined external research analysis. Uses FLASH model.
+
+    Consolidates analyze_case_law_results + analyze_web_results into one call.
+    Returns: {key_precedents, legal_standards, regulations, regulatory_standards, combined_framework, summary}
+    """
+    start_time = time.time()
+    logger.info(f"🔍 analyze_external: combined analysis of case law and web results")
+
+    prompt = prompts.P_ANALYZE_EXTERNAL.format(
+        query=query,
+        case_law_results=case_law_results or "No case law results found.",
+        web_results=web_results or "No web/regulatory results found.",
+    )
+
+    _log_llm_call("analyze_external", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        _log_llm_result("analyze_external", result, time.time() - start_time)
+        return result
+
+    logger.warning("   JSON parsing failed, returning empty external analysis")
+    return {
+        "key_precedents": [],
+        "legal_standards": [],
+        "regulations": [],
+        "regulatory_standards": [],
+        "combined_framework": "",
+        "summary": "",
     }
