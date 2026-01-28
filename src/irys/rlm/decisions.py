@@ -153,6 +153,33 @@ def _coerce_int(value: any) -> int | None:
 # WORKER TIER DECISIONS (LITE model)
 # =============================================================================
 
+async def classify_query_complexity(
+    query: str,
+    client: GeminiClient,
+) -> bool:
+    """Classify if query needs complex (PRO) or simple (FLASH) synthesis.
+
+    Uses LITE model to intelligently decide routing.
+    Returns True if complex (use PRO), False if simple (use FLASH).
+    """
+    start_time = time.time()
+    logger.info(f"🏷️ classify_query_complexity: analyzing '{query[:50]}...'")
+
+    prompt = prompts.P_CLASSIFY_QUERY.format(query=query)
+
+    _log_llm_call("classify_query_complexity", ModelTier.LITE, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.LITE)
+
+    response_upper = response.strip().upper()
+    is_complex = "COMPLEX" in response_upper
+
+    result = "COMPLEX" if is_complex else "SIMPLE"
+    logger.info(f"🏷️ Query classified as {result}")
+    _log_llm_result("classify_query_complexity", result, time.time() - start_time)
+
+    return is_complex
+
+
 async def pick_relevant_files(
     query: str,
     files: list[str],

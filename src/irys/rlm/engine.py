@@ -133,16 +133,23 @@ class RLMEngine:
         state = InvestigationState.create(query, str(repository_path))
         cache = InvestigationCache()
 
-        # Classify the query
-        state.query_classification = classify_query(query)
-        is_simple = state.query_classification['type'] == 'factual' and state.query_classification['complexity'] <= 2
+        # Classify the query using LLM (much better than keyword heuristics)
+        is_complex = await decisions.classify_query_complexity(query, self.client)
+        is_simple = not is_complex
         self._is_simple_query = is_simple  # Store for dynamic limits
+
+        # Store classification for backward compatibility
+        state.query_classification = {
+            "type": "complex" if is_complex else "simple",
+            "complexity": 4 if is_complex else 2,
+            "llm_classified": True,
+        }
 
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Query classified as {state.query_classification['type']} (complexity: {state.query_classification['complexity']}/5)" +
-            (" [SIMPLE - will use fast path]" if is_simple else ""),
+            f"Query classified as {'COMPLEX' if is_complex else 'SIMPLE'}" +
+            (" [will use FLASH for synthesis]" if is_simple else " [will use PRO for synthesis]"),
         )
 
         try:

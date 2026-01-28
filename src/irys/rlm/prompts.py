@@ -36,6 +36,29 @@ Consider which ones directly answer or relate to the query.
 Reply with just the numbers, comma-separated. Example: 1, 3, 5, 8"""
 
 
+P_CLASSIFY_QUERY = """Classify this legal query for synthesis complexity.
+
+Query: {query}
+
+You will have ALL relevant document content, facts, and citations when synthesizing.
+The question is: does this query need sophisticated legal reasoning, or is it straightforward?
+
+SIMPLE (use faster model):
+- Direct factual lookups ("What is the contract date?", "Who signed the agreement?")
+- Single-document answers ("What does clause 5 say?")
+- Basic summaries ("List the parties involved")
+
+COMPLEX (use advanced model):
+- Multi-document synthesis ("What are the key issues in this dispute?")
+- Legal analysis ("Draft a responsive pleading", "Analyze liability")
+- Strategic reasoning ("What are our strongest arguments?")
+- Timeline construction across sources
+- Contradiction analysis
+- Anything requiring legal judgment or persuasive writing
+
+Reply with only: SIMPLE or COMPLEX"""
+
+
 P_IS_SUFFICIENT = """Query: {query}
 
 Evidence gathered so far:
@@ -141,74 +164,54 @@ P_CREATE_PLAN = """You are investigating a legal query against a document reposi
 
 Query: {query}
 
-Repository structure:
-{repo_structure}
+=== DOCUMENTS IN REPOSITORY ({total_files} files) ===
+{file_list}
 
-Total files: {total_files}
+=== DOCUMENT PRIORITIZATION ===
+Based on the filenames above, categorize and prioritize:
 
-=== YOUR CAPABILITIES ===
-You have access to THREE search capabilities:
+READ FIRST (case-specific, high value):
+- Emails, correspondence, letters (contain actual communications)
+- Pleadings, complaints, answers, motions (define the dispute)
+- Contracts, agreements (primary source documents)
+- Witness statements, declarations, affidavits
 
-1. LOCAL DOCUMENT SEARCH - Search within the case documents repository
-   - Use for: Case-specific facts, evidence, party communications, exhibits
-   - Best for: Finding what happened in THIS specific case
+READ LATER (supporting):
+- Expert reports, analyses
+- Invoices, receipts, financial records
 
-2. CASE LAW SEARCH (CourtListener) - Search U.S. federal and state court opinions
-   - Use for: Legal precedents, similar cases, judicial interpretations
-   - Best for: Finding how courts have ruled on similar issues
-   - PROACTIVELY use this to support legal arguments and prevent hallucinations
+SKIP OR DEPRIORITIZE (generic reference):
+- Generic legal acts, statutes, codes (e.g., "Business Corporations Act")
+- Manuals, handbooks, guidelines (unless specifically relevant)
+- Template documents, forms
 
-3. WEB SEARCH (Tavily) - Search the web for legal information
-   - Use for: Current regulations, statutes, legal standards, industry norms
-   - Best for: Finding authoritative external legal context
-   - PROACTIVELY use this to verify legal standards and regulations
+=== YOUR TASK ===
+1. Look at the FILENAMES above and identify which documents are likely case-specific vs generic reference
+2. Select 2-3 PRIORITY FILES to read first (emails, correspondence, pleadings - NOT generic acts)
+3. Generate search terms only AFTER identifying priority files
+4. Plan external searches (case law, web) based on the query type
 
-=== INVESTIGATION STRATEGY ===
-For comprehensive legal research, you should:
-1. Search LOCAL DOCUMENTS for case-specific facts and evidence
-2. Search CASE LAW for relevant precedents when legal issues arise
-3. Search WEB for regulations/standards when compliance or industry norms are relevant
-
-Create a brief investigation plan:
-1. What are the key issues to investigate?
-2. Which files/folders should we search first?
-   - For damages/costs: prioritize CLAIMANT briefs and Statements of Claim
-   - Always check BOTH party briefs if they exist
-3. What search terms should we use for LOCAL documents?
-   - Provide individual search terms (1-2 words each)
-   - Focus on NOUNS: names, places, technical terms, dates
-4. Should we search CASE LAW? For what legal issues?
-5. Should we search the WEB? For what regulations/standards?
-6. What would constitute a sufficient answer?
-
-Share your reasoning:
-- Why are you focusing on these issues?
-- What type of documents are most likely to have the answer?
-- What external legal context (case law, regulations) might strengthen the analysis?
-
-CRITICAL: Generate CONCRETE search queries, NOT templates or placeholders.
-BAD examples (DO NOT USE):
-- "elements of [specific claim]"
-- "defenses to [claim type]"
-- "[subject matter] regulations"
-
-GOOD examples (USE THESE):
-- "breach of warranty elements"
-- "negligent misrepresentation damages"
-- "aircraft maintenance standards FAA"
+=== EXTERNAL SEARCH CAPABILITIES ===
+- CASE LAW (CourtListener): U.S. court opinions, precedents
+- WEB SEARCH (Tavily): Regulations, statutes, standards, company info
 
 Reply in JSON:
 {{
-    "reasoning": "Your analysis of the query and why you're taking this approach",
+    "reasoning": "Brief analysis of what files look case-specific vs generic, and your strategy",
     "key_issues": ["issue1", "issue2"],
-    "priority_files": ["file1.pdf", "file2.docx"],
-    "search_terms": ["term1", "term2", "term3"],
-    "or_groups": [["term1", "synonym1"], ["term2", "variant2", "variant3"]],
-    "case_law_searches": ["breach of warranty elements", "negligent misrepresentation standard"],
-    "web_searches": ["FAA aircraft maintenance regulations", "aviation industry inspection standards"],
-    "success_criteria": "What we need to find to answer the query",
-    "potential_challenges": "What might make this query difficult to answer"
-}}"""
+    "priority_files": ["exact_filename_from_list.pdf", "another_file.pdf"],
+    "skip_files": ["generic_act.pdf", "reference_manual.pdf"],
+    "search_terms": ["term1", "term2"],
+    "case_law_searches": [],
+    "web_searches": [],
+    "success_criteria": "What we need to find",
+    "potential_challenges": "What might be difficult"
+}}
+
+CRITICAL:
+- priority_files must be EXACT filenames from the list above
+- DO NOT prioritize generic legal acts or reference documents
+- Emails and correspondence almost always contain the most relevant case-specific information"""
 
 
 P_ANALYZE_RESULTS = """You are analyzing search results for a legal investigation.
