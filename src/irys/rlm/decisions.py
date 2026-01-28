@@ -478,7 +478,7 @@ async def decide_next_action(
 
 async def create_plan(
     query: str,
-    repo_structure: str,
+    file_list: str,
     total_files: int,
     client: GeminiClient,
 ) -> dict:
@@ -488,7 +488,7 @@ async def create_plan(
 
     prompt = prompts.P_CREATE_PLAN.format(
         query=query,
-        repo_structure=repo_structure,
+        file_list=file_list,
         total_files=total_files,
     )
 
@@ -629,12 +629,18 @@ async def synthesize(
     client: GeminiClient,
     external_research: str = "",
     pinned_content: str = "",
+    tier: ModelTier = ModelTier.PRO,  # Can use FLASH for simple queries - only model changes
 ) -> str:
-    """Synthesize final answer. Uses PRO model."""
+    """Synthesize final answer.
+
+    Uses PRO model by default. For simple queries, can use FLASH tier but
+    all other parameters (prompt, max_tokens, system prompt) stay the same.
+    """
     start_time = time.time()
     evidence_lines = evidence.count('\n') + 1 if evidence else 0
     pinned_info = f", {len(pinned_content)} chars pinned" if pinned_content else ""
-    logger.info(f"📝 synthesize: creating final answer from {evidence_lines} evidence lines{pinned_info}")
+    tier_label = "FLASH" if tier == ModelTier.FLASH else "PRO"
+    logger.info(f"📝 synthesize [{tier_label}]: creating final answer from {evidence_lines} evidence lines{pinned_info}")
 
     prompt = prompts.P_SYNTHESIZE.format(
         query=query,
@@ -644,8 +650,8 @@ async def synthesize(
         pinned_content=pinned_content or "No decisive documents identified.",
     )
 
-    _log_llm_call("synthesize", ModelTier.PRO, prompt, start_time)
-    response = await client.complete(prompt, tier=ModelTier.PRO)
+    _log_llm_call("synthesize", tier, prompt, start_time)
+    response = await client.complete(prompt, tier=tier)
 
     logger.info(f"✨ Synthesis complete: {len(response)} chars")
     _log_llm_result("synthesize", f"{len(response)} char response", time.time() - start_time)

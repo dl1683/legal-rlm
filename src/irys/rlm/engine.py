@@ -1186,26 +1186,23 @@ Query: {state.query}
             sources_used.append("decisive_documents")
         state.findings["sources_used"] = sources_used
 
-        # OPTIMIZATION: Use FLASH for simple queries
-        if is_simple and self.config.use_flash_for_simple:
-            logger.info("Using FLASH model for simple query synthesis")
-            response = await decisions.synthesize_simple(
-                query=state.query,
-                evidence=evidence or "No specific findings accumulated",
-                citations=citations or "No citations collected",
-                pinned_content=pinned_content,
-                client=self.client,
-            )
-        else:
-            # Full synthesis with all four sources clearly separated
-            response = await decisions.synthesize(
-                query=state.query,
-                evidence=evidence or "No specific findings accumulated",
-                citations=citations or "No citations collected",
-                external_research=f"=== CASE LAW (CourtListener) ===\n{case_law_text}\n\n=== REGULATIONS/STANDARDS (Web) ===\n{web_text}",
-                pinned_content=pinned_content,
-                client=self.client,
-            )
+        # Choose tier: FLASH for simple queries, PRO for complex
+        # NOTE: Only the model changes - prompt, max_tokens, system prompt stay the same
+        from irys.core.models import ModelTier
+        synthesis_tier = ModelTier.FLASH if (is_simple and self.config.use_flash_for_simple) else ModelTier.PRO
+        if synthesis_tier == ModelTier.FLASH:
+            logger.info("Using FLASH model for simple query synthesis (same params as PRO)")
+
+        # Full synthesis with all four sources clearly separated
+        response = await decisions.synthesize(
+            query=state.query,
+            evidence=evidence or "No specific findings accumulated",
+            citations=citations or "No citations collected",
+            external_research=f"=== CASE LAW (CourtListener) ===\n{case_law_text}\n\n=== REGULATIONS/STANDARDS (Web) ===\n{web_text}",
+            pinned_content=pinned_content,
+            client=self.client,
+            tier=synthesis_tier,
+        )
 
         state.findings["final_output"] = response
         source_count = 4 if pinned_content else 3
