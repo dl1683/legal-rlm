@@ -310,6 +310,57 @@ class ChatApp:
 
         asyncio.run(_run())
 
+    def run_investigation_with_upload_async(
+        self,
+        query: str,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+        use_context: bool = True,
+    ):
+        """Run investigation with uploaded files in background thread.
+
+        Handles S3 vs local storage mode, maintains conversation context,
+        and cleans up temp files after each turn.
+        """
+        async def _run():
+            repo_path = None
+            try:
+                # Handle file storage based on mode
+                if self.storage_mode != "local":
+                    # S3 mode: upload files then download to temp
+                    s3_prefix = await self._upload_files_to_s3(files, session_id)
+                    repo_path = await self._download_s3_to_temp(s3_prefix, session_id)
+                else:
+                    # Local mode: save directly to temp
+                    repo_path = self._save_files_to_temp(files, session_id)
+
+                # Run investigation
+                client = GeminiClient(api_key=self.api_key)
+                engine = RLMEngine(
+                    gemini_client=client,
+                    config=RLMConfig(),
+                    on_step=self.on_thinking_step,
+                    on_citation=self.on_citation,
+                )
+
+                # Build query with context if we have conversation history
+                if use_context and self.session and self.session.conversation:
+                    enhanced_query = self._build_context_prompt(query)
+                else:
+                    enhanced_query = query
+
+                state = await engine.investigate(enhanced_query, str(repo_path))
+                final_output = state.findings.get("final_output", "No output generated")
+                self.update_queue.put(("complete", final_output))
+
+            except Exception as e:
+                self.update_queue.put(("error", str(e)))
+            finally:
+                # Cleanup temp directory after each turn
+                self._cleanup_session(session_id)
+
+        asyncio.run(_run())
+
     def chat(
         self,
         message: str,
