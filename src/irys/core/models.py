@@ -135,6 +135,7 @@ class ModelConfig:
     max_output_tokens: int = 8192
     cost_per_1m_input: float = 0.075  # Default Gemini 2.5 Flash pricing
     cost_per_1m_output: float = 0.30
+    fallback_model_id: str = ""  # Fallback model when primary is unavailable (503)
 
 
 # Model configurations per tier
@@ -149,12 +150,13 @@ MODEL_CONFIGS: dict[ModelTier, ModelConfig] = {
         cost_per_1m_output=0.40,
     ),
     ModelTier.FLASH: ModelConfig(
-        model_id="gemini-2.5-flash",  # Stable - gemini-3-flash-preview has capacity issues
-        thinking_level="",  # 2.5 doesn't support thinking_level
-        temperature=0.0,  # Deterministic for consistency
-        max_output_tokens=32768,  # Strategic decisions need room
-        cost_per_1m_input=0.30,
-        cost_per_1m_output=2.50,
+        model_id="gemini-3-flash-preview",  # Primary model
+        thinking_level="medium",
+        temperature=0.0,
+        max_output_tokens=32768,
+        cost_per_1m_input=0.50,
+        cost_per_1m_output=3.00,
+        fallback_model_id="gemini-2.5-flash",  # Fallback when 503/overloaded
     ),
     ModelTier.PRO: ModelConfig(
         model_id="gemini-2.5-pro",
@@ -343,19 +345,60 @@ class GeminiClient:
         # Acquire rate limit token
         await self._rate_limiter.acquire()
 
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.client.models.generate_content,
-                    model=mc.model_id,
-                    contents=contents,
-                    config=config,
-                ),
-                timeout=request_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"API call to {mc.model_id} timed out after {request_timeout}s")
-            raise TimeoutError(f"API call timed out after {request_timeout}s")
+        # Try primary model with retry, fallback on 503
+        model_to_use = mc.model_id
+        max_attempts = 2
+        last_error = None
+
+        for attempt in range(max_attempts):
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.models.generate_content,
+                        model=model_to_use,
+                        contents=contents,
+                        config=config,
+                    ),
+                    timeout=request_timeout,
+                )
+                break  # Success
+            except asyncio.TimeoutError:
+                logger.error(f"API call to {model_to_use} timed out after {request_timeout}s")
+                raise TimeoutError(f"API call timed out after {request_timeout}s")
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                # Check for 503 overloaded error
+                if "503" in error_str or "UNAVAILABLE" in error_str or "overloaded" in error_str.lower():
+                    if attempt < max_attempts - 1:
+                        logger.warning(f"{model_to_use} overloaded, retrying in 2s... (attempt {attempt + 1}/{max_attempts})")
+                        await asyncio.sleep(2)
+                    elif mc.fallback_model_id:
+                        # Switch to fallback model
+                        logger.warning(f"{model_to_use} still overloaded after {max_attempts} attempts, falling back to {mc.fallback_model_id}")
+                        model_to_use = mc.fallback_model_id
+                        # One more attempt with fallback
+                        try:
+                            response = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    self.client.models.generate_content,
+                                    model=model_to_use,
+                                    contents=contents,
+                                    config=config,
+                                ),
+                                timeout=request_timeout,
+                            )
+                            break  # Fallback succeeded
+                        except Exception as fallback_error:
+                            raise fallback_error
+                    else:
+                        raise e
+                else:
+                    raise e
+        else:
+            # All retries exhausted
+            if last_error:
+                raise last_error
 
         # Track usage
         self._usage[tier].requests += 1
