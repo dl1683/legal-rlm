@@ -913,14 +913,26 @@ def main():
     parser.add_argument("--api-key", help="Gemini API key")
     parser.add_argument("--port", type=int, default=7863, help="Port to run on")
     parser.add_argument("--share", action="store_true", help="Create public link")
+    parser.add_argument(
+        "--server-name",
+        default="0.0.0.0",
+        help="Server hostname to bind to (default: 0.0.0.0 for all interfaces)",
+    )
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("Warning: No GEMINI_API_KEY provided")
 
+    storage_mode = get_storage_mode()
+    print(f"[INFO] Storage mode: {storage_mode}")
+
     app = create_chat_app(api_key=api_key)
-    app.launch(server_port=args.port, share=args.share)
+    app.launch(
+        server_port=args.port,
+        server_name=args.server_name,
+        share=args.share,
+    )
 
 
 if __name__ == "__main__":
