@@ -24,6 +24,23 @@ from . import decisions
 logger = logging.getLogger(__name__)
 
 
+def _fmt_list(items: list, max_items: int = 3, max_len: int = 50) -> str:
+    """Format a list for display: 'item1, item2, item3...'"""
+    if not items:
+        return "(none)"
+    # Handle items that might be dicts or other types
+    display = []
+    for item in items[:max_items]:
+        if isinstance(item, dict):
+            # Try common keys
+            s = item.get("description") or item.get("name") or item.get("file") or str(item)
+        else:
+            s = str(item)
+        display.append(s[:max_len] if len(s) > max_len else s)
+    suffix = f"... (+{len(items) - max_items} more)" if len(items) > max_items else ""
+    return ", ".join(display) + suffix
+
+
 @dataclass
 class RLMConfig:
     """Configuration for RLM engine."""
@@ -145,21 +162,25 @@ class RLMEngine:
             "llm_classified": True,
         }
 
+        # Get repo info for informative step message
+        repo_name = Path(repository_path).name
+        file_count = len(repo.list_files())
+        total_chars = repo.metadata.total_chars if repo.metadata else 0
+
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Query classified as {'COMPLEX' if is_complex else 'SIMPLE'}" +
-            (" [will use FLASH for synthesis]" if is_simple else " [will use PRO for synthesis]"),
+            f"Starting: \"{query[:60]}{'...' if len(query) > 60 else ''}\" on {repo_name} ({file_count} files, {total_chars:,} chars) → {'FLASH' if is_simple else 'PRO'} synthesis",
         )
 
         try:
             # Check if small repository - can skip complex RLM search
             if repo.is_small_repo:
-                total_chars = repo.metadata.total_chars if repo.metadata else 0
+                file_names = [Path(f).name for f in repo.list_files()[:5]]
                 self._emit_step(
                     state,
                     StepType.THINKING,
-                    f"Small repository detected ({total_chars:,} chars) - loading all content directly",
+                    f"Small repo mode: {_fmt_list(file_names, 4, 30)}",
                 )
                 await self._direct_answer(state, repo)
             else:
@@ -212,7 +233,8 @@ class RLMEngine:
         2. Extract triggers and do external research (with iteration)
         3. Use same _synthesize() as large repos for consistency
         """
-        self._emit_step(state, StepType.READING, "Loading all documents...")
+        file_names = [Path(f).name for f in repo.list_files()]
+        self._emit_step(state, StepType.READING, f"Loading: {_fmt_list(file_names, 4, 25)}")
 
         # Load all content directly - no complex search needed for small repos
         all_content = repo.get_all_content()
@@ -224,7 +246,7 @@ class RLMEngine:
         self._emit_step(
             state,
             StepType.FINDING,
-            f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
+            f"Loaded {state.documents_read} documents ({len(all_content):,} chars total)",
         )
 
         # Track executed queries for iterative external research
@@ -236,7 +258,7 @@ class RLMEngine:
                 self._emit_step(
                     state,
                     StepType.THINKING,
-                    f"External research round {research_round + 1}...",
+                    f"External research (round {research_round + 1}/2)...",
                 )
 
                 # Extract triggers from content
@@ -247,7 +269,8 @@ class RLMEngine:
                 state.add_triggers(triggers_result)
 
                 if not state.has_external_triggers(min_triggers=2):
-                    self._emit_step(state, StepType.THINKING, "No external research triggers found")
+                    trigger_count = len(state.external_triggers.get("case_law", [])) + len(state.external_triggers.get("web", []))
+                    self._emit_step(state, StepType.THINKING, f"Insufficient triggers ({trigger_count} found, need 2+) - skipping external")
                     break
 
                 triggers_summary = state.get_trigger_summary()
@@ -295,10 +318,15 @@ class RLMEngine:
                     "web_searches": new_web,
                 }
 
+                queries_preview = []
+                if new_case_law:
+                    queries_preview.append(f"CaseLaw[{_fmt_list(new_case_law, 2, 30)}]")
+                if new_web:
+                    queries_preview.append(f"Web[{_fmt_list(new_web, 2, 30)}]")
                 self._emit_step(
                     state,
                     StepType.THINKING,
-                    f"Round {research_round + 1}: {len(new_case_law)} case law + {len(new_web)} web queries",
+                    f"Round {research_round + 1}: {' | '.join(queries_preview)}",
                 )
 
                 await self._execute_external_searches(state)
@@ -404,9 +432,9 @@ class RLMEngine:
 
     async def _create_plan(self, state: InvestigationState, repo: MatterRepository):
         """Phase 1: Create investigation plan using LLM."""
-        self._emit_step(state, StepType.THINKING, "Analyzing repository structure...")
-
         stats = repo.get_stats()
+
+        self._emit_step(state, StepType.THINKING, f"Analyzing: {stats.total_files} files, {stats.total_size_kb:,}KB across {stats.folder_count} folders")
         file_list = repo.get_file_list()
 
         # Format file list for LLM - show filenames so it can prioritize
@@ -471,10 +499,12 @@ class RLMEngine:
             for term in terms[:2]:
                 state.add_lead(f"Search for: {term}", source="fallback")
 
+        # Show actual lead descriptions in step message
+        lead_descriptions = [l.description for l in state.leads]
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Plan created with {len(state.leads)} initial leads",
+            f"Plan: {_fmt_list(lead_descriptions, 3, 45)}",
             details=plan,
         )
 
@@ -511,7 +541,7 @@ class RLMEngine:
             self._emit_step(
                 state,
                 StepType.THINKING,
-                "No external research needed - focusing on repository documents",
+                "No external queries generated - local documents should suffice",
             )
             return
 
@@ -524,11 +554,15 @@ class RLMEngine:
         web_queries = web_queries[:self.config.max_web_queries] if web_queries else []
 
         total_queries = len(case_law_queries) + len(web_queries)
+        queries_preview = []
+        if case_law_queries:
+            queries_preview.append(f"CaseLaw: {_fmt_list(case_law_queries, 2, 35)}")
+        if web_queries:
+            queries_preview.append(f"Web: {_fmt_list(web_queries, 2, 35)}")
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Running {total_queries} external search{'es' if total_queries > 1 else ''} "
-            f"({len(case_law_queries)} case law, {len(web_queries)} web)...",
+            f"External search ({total_queries}): {' | '.join(queries_preview)}",
         )
 
         # Helper for case law search
@@ -578,20 +612,22 @@ class RLMEngine:
                     # Case law result
                     if data:
                         self._external_research["case_law"].extend(data)
+                        case_names = [c.get("case_name", "Unknown") for c in data]
                         self._emit_step(
                             state,
                             StepType.FINDING,
-                            f"Found {len(data)} cases for '{query[:30]}...'",
+                            f"CaseLaw ({len(data)}): {_fmt_list(case_names, 2, 40)}",
                         )
                 else:
                     # Web result
                     web_results = data.get("results", [])
                     if web_results:
                         self._external_research["web"].extend(web_results)
+                        titles = [r.get("title", "Untitled") for r in web_results]
                         self._emit_step(
                             state,
                             StepType.FINDING,
-                            f"Found {len(web_results)} web results for '{query[:30]}...'",
+                            f"Web ({len(web_results)}): {_fmt_list(titles, 2, 40)}",
                         )
                     if data.get("answer"):
                         self._external_research["web_answer"] = data["answer"]
@@ -602,10 +638,11 @@ class RLMEngine:
                     _, cases = await search_case_law(query)
                     if cases:
                         self._external_research["case_law"].extend(cases)
+                        case_names = [c.get("case_name", "Unknown") for c in cases]
                         self._emit_step(
                             state,
                             StepType.FINDING,
-                            f"Found {len(cases)} cases for '{query[:30]}...'",
+                            f"CaseLaw ({len(cases)}): {_fmt_list(case_names, 2, 40)}",
                         )
 
             if web_queries and self.external_search:
@@ -614,10 +651,11 @@ class RLMEngine:
                     web_results = result_data.get("results", [])
                     if web_results:
                         self._external_research["web"].extend(web_results)
+                        titles = [r.get("title", "Untitled") for r in web_results]
                         self._emit_step(
                             state,
                             StepType.FINDING,
-                            f"Found {len(web_results)} web results for '{query[:30]}...'",
+                            f"Web ({len(web_results)}): {_fmt_list(titles, 2, 40)}",
                         )
                     if result_data.get("answer"):
                         self._external_research["web_answer"] = result_data["answer"]
@@ -720,10 +758,11 @@ class RLMEngine:
             # Take leads to process
             leads_to_process = pending_leads[:self.config.max_leads_per_level]
 
+            lead_descriptions = [l.description for l in leads_to_process]
             self._emit_step(
                 state,
                 StepType.THINKING,
-                f"Processing {len(leads_to_process)} leads (iteration {iteration + 1})",
+                f"Iteration {iteration + 1}: {_fmt_list(lead_descriptions, 3, 40)}",
             )
 
             # Process leads in parallel
@@ -747,10 +786,11 @@ class RLMEngine:
 
                 # Check sufficiency
                 if checkpoint_result.get("sufficient"):
+                    docs_read = state.documents_read
                     self._emit_step(
                         state,
                         StepType.THINKING,
-                        f"Sufficient evidence gathered ({facts_count} facts)",
+                        f"Sufficient: {facts_count} facts from {docs_read} docs - proceeding to synthesis",
                     )
                     break
 
@@ -846,10 +886,12 @@ class RLMEngine:
         entities = [e.name for e in state.entities.values()][:10] if state.entities else []
         triggers = state.get_trigger_summary()
 
+        # Parse triggers into a list for better formatting
+        trigger_list = [t.strip() for t in triggers.split(",") if t.strip()]
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Research triggers found: {triggers[:100]}...",
+            f"Triggers: {_fmt_list(trigger_list, 4, 30)}",
         )
 
         # Generate specific queries using accumulated triggers
@@ -880,10 +922,15 @@ class RLMEngine:
             state.findings["initial_plan"]["case_law_searches"] = list(set(existing_case_law + case_law_queries))
             state.findings["initial_plan"]["web_searches"] = list(set(existing_web + web_queries))
 
+            queries_preview = []
+            if new_case_law:
+                queries_preview.append(f"CaseLaw: {_fmt_list(new_case_law, 2, 30)}")
+            if new_web:
+                queries_preview.append(f"Web: {_fmt_list(new_web, 2, 30)}")
             self._emit_step(
                 state,
                 StepType.THINKING,
-                f"Generated {len(new_case_law)} new case law + {len(new_web)} new web queries",
+                f"New queries: {' | '.join(queries_preview)}",
             )
             return {"case_law_queries": new_case_law, "web_queries": new_web}
 
@@ -939,10 +986,12 @@ class RLMEngine:
                 state.mark_lead_investigated(lead.id, "No results found")
                 return
 
+            # Show matching document names
+            doc_names = list(set(Path(hit.file_path).name for hit in results.hits[:5]))
             self._emit_step(
                 state,
                 StepType.FINDING,
-                f"Found {len(results.hits)} matches",
+                f"Found {len(results.hits)} matches in: {_fmt_list(doc_names, 3, 30)}",
             )
 
             # CONSOLIDATED: Single analyze_search call replaces pick_relevant_hits + analyze_results + prioritize_documents
@@ -1047,10 +1096,11 @@ class RLMEngine:
         if not to_read:
             return
 
+        doc_names = [Path(fp).name for fp in to_read]
         self._emit_step(
             state,
             StepType.READING,
-            f"Reading {len(to_read)} documents",
+            f"Reading: {_fmt_list(doc_names, 3, 30)}",
         )
 
         tasks = [self._read_document(state, repo, fp, cache) for fp in to_read]
@@ -1102,7 +1152,7 @@ class RLMEngine:
                 self._emit_step(
                     state,
                     StepType.FINDING,
-                    f"Found {len(facts)} facts in {doc.filename}",
+                    f"Facts ({len(facts)}) from {doc.filename}: {_fmt_list(facts, 2, 60)}",
                 )
             state.add_facts(facts)
 
@@ -1111,10 +1161,15 @@ class RLMEngine:
             if triggers:
                 added = state.add_triggers(triggers)
                 if added > 0:
+                    # Collect all trigger values for display
+                    trigger_values = []
+                    for trigger_list in triggers.values():
+                        if isinstance(trigger_list, list):
+                            trigger_values.extend(trigger_list)
                     self._emit_step(
                         state,
                         StepType.THINKING,
-                        f"Noted {added} research trigger(s) from {doc.filename}",
+                        f"Triggers from {doc.filename}: {_fmt_list(trigger_values, 3, 30)}",
                     )
 
             # Emit insights from the extraction (show LLM's thinking)
@@ -1159,7 +1214,24 @@ class RLMEngine:
         3. Web search (Tavily - regulations/standards)
         4. Pinned DECISIVE documents OR small repo full content
         """
-        self._emit_step(state, StepType.SYNTHESIS, "Synthesizing from all sources...")
+        # Count sources for informative message
+        facts = state.findings.get("accumulated_facts", [])
+        case_law_count = len(self._external_research.get("case_law", []))
+        web_count = len(self._external_research.get("web", []))
+        pinned_count = len(state.findings.get("pinned_documents", []))
+        small_repo = bool(state.findings.get("small_repo_content"))
+
+        source_parts = [f"{len(facts)} facts"]
+        if case_law_count:
+            source_parts.append(f"{case_law_count} cases")
+        if web_count:
+            source_parts.append(f"{web_count} web")
+        if pinned_count and not small_repo:
+            source_parts.append(f"{pinned_count} decisive docs")
+        elif small_repo:
+            source_parts.append("all docs (small repo)")
+
+        self._emit_step(state, StepType.SYNTHESIS, f"Synthesizing: {', '.join(source_parts)}")
 
         # SOURCE 1: Local document evidence
         facts = state.findings.get("accumulated_facts", [])
@@ -1206,8 +1278,8 @@ class RLMEngine:
         )
 
         state.findings["final_output"] = response
-        source_count = 4 if pinned_content else 3
-        self._emit_step(state, StepType.SYNTHESIS, f"Analysis complete ({source_count} sources: docs, case law, web{', decisive docs' if pinned_content else ''})")
+        output_len = len(response)
+        self._emit_step(state, StepType.SYNTHESIS, f"Complete: {output_len:,} chars synthesized from {state.documents_read} docs")
 
     async def _load_pinned_documents(self, state: InvestigationState) -> str:
         """Load content from DECISIVE pinned documents for synthesis.
@@ -1264,10 +1336,12 @@ class RLMEngine:
                 logger.warning(f"Failed to load pinned document {filepath}: {e}")
 
         if pinned_content_parts:
+            total_chars = sum(len(p) for p in pinned_content_parts)
+            doc_names = [Path(f).name for f in list(seen_files)[:docs_loaded]]
             self._emit_step(
                 state,
                 StepType.FINDING,
-                f"Loaded {docs_loaded} decisive document(s) for synthesis"
+                f"Decisive docs ({total_chars:,} chars): {_fmt_list(doc_names, 3, 30)}"
             )
 
         return "".join(pinned_content_parts)
