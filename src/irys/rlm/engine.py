@@ -55,6 +55,7 @@ class InvestigationCache:
     """Cache to avoid redundant work."""
     extracted_docs: set = field(default_factory=set)  # Docs we've extracted facts from
     searched_terms: set = field(default_factory=set)  # Search terms we've used
+    irrelevant_docs: set = field(default_factory=set)  # Docs marked IRRELEVANT by LLM
 
     def has_extracted(self, filepath: str) -> bool:
         """Check if we've already extracted facts from this doc."""
@@ -63,6 +64,14 @@ class InvestigationCache:
     def mark_extracted(self, filepath: str):
         """Mark a doc as extracted."""
         self.extracted_docs.add(filepath)
+
+    def mark_irrelevant(self, filepath: str):
+        """Mark a doc as irrelevant (skip in future ranking)."""
+        self.irrelevant_docs.add(filepath)
+
+    def is_irrelevant(self, filepath: str) -> bool:
+        """Check if doc was marked irrelevant."""
+        return filepath in self.irrelevant_docs
 
     def is_similar_search(self, term: str) -> bool:
         """Check if we've done a similar search."""
@@ -404,13 +413,20 @@ Query: {state.query}
         self._emit_step(state, StepType.THINKING, "Analyzing repository structure...")
 
         stats = repo.get_stats()
-        structure = repo.get_structure()
-        structure_str = "\n".join(f"  {folder}: {count} files" for folder, count in structure.items())
+        file_list = repo.get_file_list()
+
+        # Format file list for LLM - show filenames so it can prioritize
+        file_list_str = "\n".join(
+            f"  - {f['filename']} ({f['size_kb']}KB, {f['type']})"
+            for f in file_list[:50]  # Limit to 50 files for context
+        )
+        if len(file_list) > 50:
+            file_list_str += f"\n  ... and {len(file_list) - 50} more files"
 
         # Use decisions layer for planning
         plan = await decisions.create_plan(
             query=state.query,
-            repo_structure=structure_str,
+            file_list=file_list_str,
             total_files=stats.total_files,
             client=self.client,
         )
@@ -444,7 +460,13 @@ Query: {state.query}
                 f"CHALLENGES: {challenges}",
             )
 
-        # Create leads from search terms - LIMIT TO 3
+        # PRIORITY: Create leads for priority files FIRST (read before searching)
+        priority_files = plan.get("priority_files", [])
+        for filepath in priority_files[:3]:  # Limit to top 3 priority files
+            if isinstance(filepath, str):
+                state.add_lead(f"Read document: {filepath}", source="initial_plan", priority=0.95)
+
+        # Then create leads from search terms
         for term in plan.get("search_terms", [])[:3]:
             if isinstance(term, str):
                 state.add_lead(f"Search for: {term}", source="initial_plan")
@@ -754,7 +776,7 @@ Query: {state.query}
                             state.add_lead(f"Search for: {term}", source="checkpoint")
                             new_leads_added += 1
                     for filepath in checkpoint_result.get("files_to_check", [])[:2]:
-                        if not cache.has_extracted(filepath):
+                        if not cache.has_extracted(filepath) and not cache.is_irrelevant(filepath):
                             state.add_lead(f"Read document: {filepath}", source="checkpoint")
                             new_leads_added += 1
 
@@ -892,9 +914,12 @@ Query: {state.query}
         if lead.description.startswith("Read document:"):
             filepath = lead.description.replace("Read document:", "").strip()
 
-            # OPTIMIZATION: Skip if already extracted
+            # OPTIMIZATION: Skip if already extracted or marked irrelevant
             if cache.has_extracted(filepath):
                 state.mark_lead_investigated(lead.id, "Already extracted")
+                return
+            if cache.is_irrelevant(filepath):
+                state.mark_lead_investigated(lead.id, "Marked irrelevant")
                 return
 
             await self._read_document(state, repo, filepath, cache)
@@ -992,12 +1017,14 @@ Query: {state.query}
             # Normalize criticality to uppercase for case-insensitive comparison
             criticality = criticality.upper() if isinstance(criticality, str) else "SUPPORTING"
 
-            # Skip irrelevant documents
+            # Skip irrelevant documents and mark them in cache
             if criticality == "IRRELEVANT":
+                if filepath:
+                    cache.mark_irrelevant(filepath)
                 continue
 
-            # Skip duplicates and already-extracted files
-            if not filepath or filepath in seen_files or cache.has_extracted(filepath):
+            # Skip duplicates, already-extracted, and previously marked irrelevant files
+            if not filepath or filepath in seen_files or cache.has_extracted(filepath) or cache.is_irrelevant(filepath):
                 continue
 
             seen_files.add(filepath)
