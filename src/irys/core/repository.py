@@ -205,6 +205,25 @@ class MatterRepository:
 
         return dict(sorted(structure.items()))
 
+    def get_file_list(self) -> list[dict]:
+        """Get list of files with names and metadata for LLM planning.
+
+        Returns list of dicts with:
+        - filename: The file name
+        - path: Relative path for reading
+        - type: File extension
+        - size_kb: Size in KB (rounded)
+        """
+        files = []
+        for file_info in self.list_files():
+            files.append({
+                "filename": file_info.filename,
+                "path": file_info.relative_path,
+                "type": file_info.file_type,
+                "size_kb": round(file_info.size_bytes / 1024),
+            })
+        return files
+
     def get_stats(self) -> RepositoryStats:
         """Get repository statistics.
 
