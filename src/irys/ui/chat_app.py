@@ -73,6 +73,7 @@ class ChatApp:
         self.session: Optional[ChatSession] = None
         self.update_queue: queue.Queue = queue.Queue()
         self.is_running = False
+        self.stop_requested = False  # Flag to stop investigation midway
 
         # Current turn state
         self.current_thinking: list[str] = []
@@ -148,28 +149,41 @@ class ChatApp:
     def chat(
         self,
         message: str,
-        history: list[tuple[str, str]],
+        history,
         repo_path: str,
-    ) -> Generator[tuple[list, str, str], None, None]:
+    ) -> Generator[tuple[list, str, str, str], None, None]:
         """
         Process a chat message and yield updates.
 
         Args:
             message: User's message
-            history: Gradio chat history
+            history: Gradio chat history (messages format)
             repo_path: Path to document repository
 
         Yields:
-            (updated_history, thinking_log, status)
+            (updated_history, thinking_log, citations_log, status)
         """
+        # Ensure history is a mutable list of dicts
+        if history is None:
+            history = []
+        else:
+            # Convert to list of dicts if needed
+            history = [
+                msg if isinstance(msg, dict) else {"role": "user" if i % 2 == 0 else "assistant", "content": str(msg)}
+                for i, msg in enumerate(history)
+            ]
+
         # Validate inputs
         if not repo_path or not Path(repo_path).exists():
-            history.append((message, "Error: Please select a valid repository directory."))
-            yield history, "", "Error: Invalid repository path"
+            history = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "Error: Please select a valid repository directory."}
+            ]
+            yield history, "", "", "Error: Invalid repository path"
             return
 
         if not message.strip():
-            yield history, "", "Please enter a question"
+            yield history, "", "", "Please enter a question"
             return
 
         # Initialize or update session
@@ -181,9 +195,13 @@ class ChatApp:
         self.current_citations = []
         self.update_queue = queue.Queue()
         self.is_running = True
+        self.stop_requested = False  # Reset stop flag
 
-        # Add user message to history with placeholder
-        history.append((message, None))
+        # Create new history with user message and placeholder
+        history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "*Investigating...*"}
+        ]
 
         # Start investigation in background
         thread = threading.Thread(
@@ -193,7 +211,6 @@ class ChatApp:
         thread.start()
 
         start_time = time.time()
-        partial_response = ""
 
         # Stream updates
         while self.is_running:
@@ -204,13 +221,16 @@ class ChatApp:
                     elapsed = time.time() - start_time
                     status = f"Investigating... ({elapsed:.1f}s) - {len(self.current_thinking)} steps"
                     thinking_display = "\n".join(self.current_thinking[-20:])  # Last 20 steps
+                    citations_display = "\n".join(self.current_citations) or "Finding sources..."
 
-                    # Update history with "thinking" indicator
-                    history[-1] = (message, f"*Investigating... ({len(self.current_thinking)} steps)*")
-                    yield history, thinking_display, status
+                    # Update assistant placeholder with progress
+                    history = history[:-1] + [{"role": "assistant", "content": f"*Investigating... ({len(self.current_thinking)} steps)*"}]
+                    yield history, thinking_display, citations_display, status
 
                 elif update_type == "citation":
-                    pass  # Citations tracked internally
+                    # Update citations display
+                    citations_display = "\n".join(self.current_citations)
+                    yield history, "\n".join(self.current_thinking[-20:]), citations_display, f"Found {len(self.current_citations)} citations"
 
                 elif update_type == "complete":
                     self.is_running = False
@@ -226,19 +246,28 @@ class ChatApp:
                     )
 
                     # Update history with final response
-                    history[-1] = (message, final_output)
+                    history = history[:-1] + [{"role": "assistant", "content": final_output}]
 
                     status = f"Complete ({elapsed:.1f}s) - Turn {len(self.session.conversation)}"
                     thinking_display = "\n".join(self.current_thinking)
+                    citations_display = "\n".join(self.current_citations) or "No citations found"
 
-                    yield history, thinking_display, status
+                    yield history, thinking_display, citations_display, status
+                    return
+
+                elif update_type == "stopped":
+                    self.is_running = False
+                    elapsed = time.time() - start_time
+                    stop_msg = f"*Investigation stopped after {elapsed:.1f}s*\n\nPartial findings:\n" + "\n".join(self.current_thinking[-5:])
+                    history = history[:-1] + [{"role": "assistant", "content": stop_msg}]
+                    yield history, "\n".join(self.current_thinking), "\n".join(self.current_citations), "Stopped by user"
                     return
 
                 elif update_type == "error":
                     self.is_running = False
                     error_msg = f"Error: {data}"
-                    history[-1] = (message, error_msg)
-                    yield history, "\n".join(self.current_thinking), f"Error: {data}"
+                    history = history[:-1] + [{"role": "assistant", "content": error_msg}]
+                    yield history, "\n".join(self.current_thinking), "\n".join(self.current_citations), f"Error: {data}"
                     return
 
             except queue.Empty:
@@ -246,16 +275,25 @@ class ChatApp:
                 if self.current_thinking:
                     elapsed = time.time() - start_time
                     thinking_display = "\n".join(self.current_thinking[-20:])
-                    yield history, thinking_display, f"Investigating... ({elapsed:.1f}s)"
+                    citations_display = "\n".join(self.current_citations) or "Finding sources..."
+                    yield history, thinking_display, citations_display, f"Investigating... ({elapsed:.1f}s)"
 
         thread.join()
 
-    def clear_chat(self) -> tuple[list, str, str]:
+    def stop_investigation(self) -> str:
+        """Stop the current investigation."""
+        if self.is_running:
+            self.stop_requested = True
+            self.update_queue.put(("stopped", "Investigation stopped by user"))
+            return "Stopping..."
+        return "No investigation running"
+
+    def clear_chat(self) -> tuple[list, str, str, str]:
         """Clear the current chat session."""
         self.session = None
         self.current_thinking = []
         self.current_citations = []
-        return [], "", "Chat cleared. Start a new conversation."
+        return [], "", "", "Chat cleared. Start a new conversation."
 
     def get_turn_details(self, turn_number: int) -> str:
         """Get detailed thinking logs for a specific turn."""
@@ -310,7 +348,6 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
 
     with gr.Blocks(
         title="Irys RLM - Legal Document Chat",
-        theme=gr.themes.Soft(),
     ) as demo:
         gr.Markdown("# Irys RLM - Legal Document Chat")
         gr.Markdown(
@@ -330,11 +367,10 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
                     )
                     browse_btn = gr.Button("Browse", scale=1)
 
-                # Chat interface
+                # Chat interface (Gradio 6.x uses messages format by default)
                 chatbot = gr.Chatbot(
                     label="Conversation",
                     height=500,
-                    show_copy_button=True,
                 )
 
                 with gr.Row():
@@ -345,6 +381,7 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
                         lines=2,
                     )
                     submit_btn = gr.Button("Send", variant="primary", scale=1)
+                    stop_btn = gr.Button("Stop", variant="stop", scale=1)
 
                 with gr.Row():
                     clear_btn = gr.Button("Clear Chat")
@@ -361,7 +398,15 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
                     thinking = gr.Textbox(
                         label="Investigation Steps",
                         interactive=False,
-                        lines=20,
+                        lines=15,
+                        autoscroll=True,
+                    )
+
+                with gr.Accordion("Citations (Current Turn)", open=True):
+                    citations = gr.Textbox(
+                        label="Sources Found",
+                        interactive=False,
+                        lines=10,
                         autoscroll=True,
                     )
 
@@ -388,7 +433,7 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
         submit_btn.click(
             fn=app.chat,
             inputs=[msg, chatbot, repo_path],
-            outputs=[chatbot, thinking, status],
+            outputs=[chatbot, thinking, citations, status],
         ).then(
             fn=lambda: "",  # Clear input after submit
             outputs=[msg],
@@ -398,7 +443,7 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
         msg.submit(
             fn=app.chat,
             inputs=[msg, chatbot, repo_path],
-            outputs=[chatbot, thinking, status],
+            outputs=[chatbot, thinking, citations, status],
         ).then(
             fn=lambda: "",
             outputs=[msg],
@@ -407,7 +452,13 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
         # Clear chat
         clear_btn.click(
             fn=app.clear_chat,
-            outputs=[chatbot, thinking, status],
+            outputs=[chatbot, thinking, citations, status],
+        )
+
+        # Stop investigation
+        stop_btn.click(
+            fn=app.stop_investigation,
+            outputs=[status],
         )
 
     return demo
