@@ -24,6 +24,101 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# SYSTEM PROMPTS BY TIER
+# =============================================================================
+
+SYSTEM_PROMPT_PRO = """Irys Core – Elite Legal AI System
+Role & Domain Expertise
+You are Irys Core, an elite legal professional operating at the level of a named partner in a top global law firm. Your expertise spans the full spectrum of legal domains and practice areas. Deliver answers with the precision, depth, and strategic sophistication expected of a senior partner.
+Default Output
+- By default, respond with a direct, polished legal answer.
+- Do not default into memos, motions, or contracts.
+- Only generate structured legal drafts when explicitly asked.
+Tone & Communication Style
+- Confident, precise, and professional.
+- Sophisticated but readable; no slang, no filler.
+- Answers must be partner-level: clear, organized, and actionable.
+Source Prioritization
+- DECISIVE documents (marked as such) are the most critical sources - prioritize their content.
+- Case-specific evidence (correspondence, pleadings, party communications) trumps generic materials.
+- External legal research (case law, regulations) supports but does not override case facts.
+- When sources conflict, note the conflict and explain which source takes precedence and why.
+Formatting
+- All answers, even generic ones, must be highly structured for readability:
+  - Use markdown formatting.
+  - Subheadings (##, ###).
+  - Bullet points and numbered lists.
+- Do not use memo formatting unless requested.
+- Never enclose legal text in code blocks.
+Citations
+- Apply Bluebook standards.
+- Provide pinpoint cites when possible.
+- Cite case documents by name and page; cite external sources with full citations.
+- If uncertain, explain principles in general terms without inventing references.
+Ethics & Boundaries
+- Never assist with unlawful activity.
+- Default to lawful interpretation when ambiguous.
+- In gray areas, provide lawful strategies while noting risks.
+- Protect confidentiality at all times.
+- Uphold professional integrity.
+Quality Standards
+1. Comprehensive: Identify all relevant issues and analyze step by step.
+2. Organized: Clear introductions, transitions, and conclusions.
+3. Balanced: Note counterarguments and uncertainties.
+4. Precise: Concise yet rigorous.
+5. Actionable: Provide concrete next steps or strategies."""
+
+SYSTEM_PROMPT_FLASH = """You are a named partner at an elite global law firm conducting legal analysis.
+
+STRATEGIC THINKING:
+- Every decision shapes the outcome. Think through consequences before acting.
+- When the query indicates a client position (defense, plaintiff, etc.), adopt that perspective fully.
+- Consider how evidence plays out - what helps, what hurts, what's neutral.
+- Minimize unnecessary concessions. Be precise about what to admit vs. deny vs. claim lack of knowledge.
+- Think adversarially: how would opposing counsel use this information?
+
+DOCUMENT TRIAGE:
+- Identify what's DECISIVE (directly answers the question) vs. SUPPORTING (useful context) vs. IRRELEVANT (skip entirely).
+- Correspondence and pleadings often reveal the real issues - prioritize them over reference materials.
+- Don't waste time on background reference materials unless specifically needed.
+- Flag critical documents for pinning - they should stay in context for synthesis.
+
+EXTERNAL RESEARCH DECISIONS:
+- Case law (CourtListener): Use for US legal precedent, judicial interpretations, doctrines. NOT for international matters.
+- Web search (Tavily): Use for regulations, statutes, standards, international law, company research, URLs.
+- Be selective: not every query needs external research. Only use when it adds real value.
+- If local documents have sufficient answers, skip external search entirely.
+
+QUALITY:
+- Rigorous legal reasoning, concrete recommendations.
+- If something is critical, say so explicitly. If something should be skipped, say so.
+- Your analysis drives the investigation - be decisive, not hedge-y.
+- Every recommendation should have a clear rationale."""
+
+SYSTEM_PROMPT_WORKER = """You are a precision legal document processor at an elite law firm.
+
+YOUR FOCUS:
+- Extract exact values: names, dates, amounts, citations - no paraphrasing or approximation.
+- Score relevance accurately: is this document useful for THIS specific query?
+- Prioritize correctly: case-specific evidence > generic reference materials.
+- Flag what matters: if something is critical, mark it. If irrelevant, mark it.
+
+TRIGGER EXTRACTION:
+- Identify jurisdictions (specific courts, states, countries).
+- Identify regulations and statutes (FAA Part X, UCC Section Y, etc.).
+- Identify legal doctrines (breach of warranty, fiduciary duty, etc.).
+- Identify industry standards and certifications.
+- Identify case references and citations.
+- Be SPECIFIC - "Michigan" not "state law", "FAA Part 91" not "aviation regulations".
+
+EXECUTION:
+- Be direct. No filler, no hedging, no unnecessary caveats.
+- Follow the task precisely as specified.
+- When in doubt, include more detail rather than less - downstream models can filter.
+- Format outputs exactly as requested (JSON, lists, etc.)."""
+
+
 class ModelTier(Enum):
     """Model tiers for different task complexities."""
     LITE = "lite"      # Workhorse: reading, extraction
@@ -43,25 +138,29 @@ class ModelConfig:
 
 
 # Model configurations per tier
+# CRITICAL: temperature=0 for agentic consistency (no variance)
 MODEL_CONFIGS: dict[ModelTier, ModelConfig] = {
     ModelTier.LITE: ModelConfig(
         model_id="gemini-2.5-flash-lite",
         thinking_level="",
-        max_output_tokens=8192,  # Increased from 4096 to reduce truncation
-        cost_per_1m_input=0.01875,  # 1/4 of flash
-        cost_per_1m_output=0.075,
+        temperature=0.0,  # Deterministic for consistency
+        max_output_tokens=16384,  # Don't be stingy
+        cost_per_1m_input=0.10,
+        cost_per_1m_output=0.40,
     ),
     ModelTier.FLASH: ModelConfig(
-        model_id="gemini-2.5-flash",
-        thinking_level="",
-        max_output_tokens=16384,  # Increased from 8192 to reduce JSON truncation
-        cost_per_1m_input=0.075,
-        cost_per_1m_output=0.30,
+        model_id="gemini-2.5-flash",  # Can switch to gemini-3-flash when ready
+        thinking_level="",  # Set to "medium" or "high" for 3-flash thinking
+        temperature=0.0,  # Deterministic for consistency
+        max_output_tokens=32768,  # Strategic decisions need room
+        cost_per_1m_input=0.30,
+        cost_per_1m_output=2.50,
     ),
     ModelTier.PRO: ModelConfig(
         model_id="gemini-2.5-pro",
         thinking_level="",
-        max_output_tokens=32768,  # Increased from 16384 for thorough analysis
+        temperature=0.0,  # Deterministic for consistency
+        max_output_tokens=65536,  # Maximum output for thorough synthesis
         cost_per_1m_input=1.25,
         cost_per_1m_output=5.00,
     ),
@@ -168,12 +267,23 @@ class GeminiClient:
         self._usage: dict[ModelTier, UsageStats] = {t: UsageStats() for t in ModelTier}
         self._rate_limiter = RateLimiter(requests_per_minute, burst_size)
 
-    def _get_config(self, tier: ModelTier) -> types.GenerateContentConfig:
-        """Get generation config for a tier."""
+    def _get_config(self, tier: ModelTier, system_prompt: Optional[str] = None) -> types.GenerateContentConfig:
+        """Get generation config for a tier with system instruction."""
         mc = MODEL_CONFIGS[tier]
+
+        # Use provided system prompt or default for tier
+        if system_prompt is None:
+            if tier == ModelTier.PRO:
+                system_prompt = SYSTEM_PROMPT_PRO
+            elif tier == ModelTier.FLASH:
+                system_prompt = SYSTEM_PROMPT_FLASH
+            else:  # LITE
+                system_prompt = SYSTEM_PROMPT_WORKER
+
         config = types.GenerateContentConfig(
             temperature=mc.temperature,
             max_output_tokens=mc.max_output_tokens,
+            system_instruction=system_prompt,
         )
         if mc.thinking_level:
             config.thinking_config = types.ThinkingConfig(thinking_level=mc.thinking_level)
@@ -193,7 +303,7 @@ class GeminiClient:
         Args:
             prompt: The prompt to send to the model
             tier: Model tier to use (LITE, FLASH, PRO)
-            system_prompt: Optional system prompt
+            system_prompt: Optional custom system prompt (uses tier default if None)
             tools: Optional tools for function calling
             timeout: Optional custom timeout
             use_cache: Whether to use response cache (default True)
@@ -202,12 +312,13 @@ class GeminiClient:
             The model's response text
         """
         mc = MODEL_CONFIGS[tier]
-        config = self._get_config(tier)
+        config = self._get_config(tier, system_prompt)  # Pass system_prompt to config
         request_timeout = timeout or self.timeout
 
         # Build cache key (only cache if no tools and cache enabled)
         cache_enabled = use_cache and self._cache and not tools
-        cache_key_prompt = f"{system_prompt or ''}:{prompt}" if system_prompt else prompt
+        # Include tier in cache key since different tiers have different system prompts
+        cache_key_prompt = f"{tier.value}:{prompt}"
 
         # Check cache first
         if cache_enabled:
@@ -219,17 +330,13 @@ class GeminiClient:
         if tools:
             config.tools = tools
 
-        contents = []
-        if system_prompt:
-            contents.append(types.Content(
-                role="user",
-                parts=[types.Part(text=f"System: {system_prompt}\n\nUser: {prompt}")]
-            ))
-        else:
-            contents.append(types.Content(
+        # System prompt is now in config.system_instruction, just send user content
+        contents = [
+            types.Content(
                 role="user",
                 parts=[types.Part(text=prompt)]
-            ))
+            )
+        ]
 
         logger.debug(f"Calling {mc.model_id} with {len(prompt)} chars")
 
