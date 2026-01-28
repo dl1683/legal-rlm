@@ -107,6 +107,156 @@ class ChatApp:
         self.current_citations.append(citation_text)
         self.update_queue.put(("citation", citation_text))
 
+    def _generate_session_id(self) -> str:
+        """Generate a unique session/job ID."""
+        return f"chat_{uuid.uuid4().hex[:12]}"
+
+    async def _upload_files_to_s3(
+        self,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+    ) -> str:
+        """Upload files to S3 and return the S3 prefix.
+
+        Args:
+            files: List of (filename, content) tuples
+            session_id: Unique session identifier
+
+        Returns:
+            S3 prefix where files were uploaded
+        """
+        from ..service.s3_repository import S3Repository
+
+        s3_repo = S3Repository(
+            bucket=self.config.s3_bucket,
+            config=self.config,
+        )
+
+        prefix = await s3_repo.upload_files(session_id, files)
+        logger.info(f"Uploaded {len(files)} files to S3: {prefix}")
+        return prefix
+
+    async def _download_s3_to_temp(self, s3_prefix: str, session_id: str) -> Path:
+        """Download files from S3 prefix to temp directory for processing.
+
+        Args:
+            s3_prefix: S3 prefix containing the files
+            session_id: Session ID for temp dir naming
+
+        Returns:
+            Path to temp directory with downloaded files
+        """
+        from ..service.s3_repository import S3Repository
+
+        s3_repo = S3Repository(
+            bucket=self.config.s3_bucket,
+            prefix=s3_prefix,
+            config=self.config,
+        )
+
+        temp_dir = await s3_repo.download_to_temp(session_id)
+        self._temp_dirs[session_id] = temp_dir
+        logger.info(f"Downloaded S3 files to temp: {temp_dir}")
+        return temp_dir
+
+    def _save_files_to_temp(
+        self,
+        files: list[tuple[str, bytes]],
+        session_id: str,
+    ) -> Path:
+        """Save uploaded files to local temp directory.
+
+        Args:
+            files: List of (relative_path, content) tuples - path can include subdirectories
+            session_id: Unique session identifier
+
+        Returns:
+            Path to temp directory with files
+        """
+        temp_dir = Path(self.config.temp_dir) / session_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        for relative_path, content in files:
+            file_path = temp_dir / relative_path
+            # Create parent directories if they don't exist (for folder uploads)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(content)
+            logger.debug(f"Saved file: {file_path}")
+
+        self._temp_dirs[session_id] = temp_dir
+        logger.info(f"Saved {len(files)} files to temp: {temp_dir}")
+        return temp_dir
+
+    def _cleanup_session(self, session_id: str) -> None:
+        """Clean up temp directory for a session."""
+        if session_id in self._temp_dirs:
+            import shutil
+            temp_dir = self._temp_dirs.pop(session_id)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temp directory: {temp_dir}")
+
+    def _extract_files_from_upload(
+        self,
+        uploaded_files: list,
+    ) -> tuple[list[tuple[str, bytes]], str | None]:
+        """Extract files from Gradio upload, preserving folder structure.
+
+        Args:
+            uploaded_files: List of Gradio file objects (can be files or folder contents)
+
+        Returns:
+            Tuple of (list of (relative_path, content) tuples, error message or None)
+        """
+        if not uploaded_files:
+            return [], None
+
+        files: list[tuple[str, bytes]] = []
+
+        # Find common prefix to determine folder structure
+        # When uploading a folder, Gradio preserves the path structure
+        all_paths = [Path(f.name) for f in uploaded_files]
+
+        # Check if this looks like a folder upload (paths have common parent structure)
+        # Folder uploads typically have paths like: /tmp/gradio/.../folder_name/subdir/file.pdf
+        common_prefix = None
+        if len(all_paths) > 1:
+            # Find the common ancestor directory
+            try:
+                common_prefix = Path(os.path.commonpath([str(p) for p in all_paths]))
+            except ValueError:
+                # No common path (different drives on Windows, etc.)
+                common_prefix = None
+
+        for file in uploaded_files:
+            try:
+                file_path = Path(file.name)
+
+                # Determine relative path for folder structure preservation
+                if common_prefix and common_prefix != file_path:
+                    # This is a folder upload - preserve structure relative to common prefix
+                    relative_path = file_path.relative_to(common_prefix)
+                else:
+                    # Single file or no common structure - just use filename
+                    relative_path = Path(file_path.name)
+
+                # Skip hidden files and system files
+                if any(part.startswith('.') for part in relative_path.parts):
+                    logger.debug(f"Skipping hidden file: {relative_path}")
+                    continue
+
+                with open(file.name, "rb") as f:
+                    content = f.read()
+
+                files.append((str(relative_path), content))
+                logger.debug(f"Extracted file: {relative_path}")
+
+            except Exception as e:
+                logger.error(f"Error reading file {file.name}: {e}")
+                return [], f"Error reading file {file.name}: {e}"
+
+        return files, None
+
     def _build_context_prompt(self, query: str) -> str:
         """Build prompt with conversation context."""
         if not self.session or not self.session.conversation:
