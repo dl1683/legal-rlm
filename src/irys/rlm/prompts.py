@@ -104,16 +104,6 @@ DO NOT INCLUDE:
 Reply with just the search terms, one per line. No explanations."""
 
 
-P_CLASSIFY_QUERY = """Classify this query:
-
-Query: {query}
-
-Reply with one word:
-- SIMPLE: Basic factual question (who, what, when, where)
-- ANALYTICAL: Requires understanding and explanation
-- COMPLEX: Requires deep analysis across multiple sources"""
-
-
 P_PRIORITIZE_DOCUMENTS = """You are ranking candidate documents for relevance to a legal query.
 
 Query: {query}
