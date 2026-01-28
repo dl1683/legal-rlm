@@ -5,6 +5,7 @@ Features:
 - Multiple queries about the same repository
 - Thinking logs stored separately (not sent to AI)
 - Only user messages + AI responses used for context
+- Supports both local folder browsing and S3 file upload modes
 """
 
 import gradio as gr
@@ -12,6 +13,8 @@ import asyncio
 import threading
 import queue
 import time
+import uuid
+import logging
 from pathlib import Path
 from typing import Optional, Generator
 from dataclasses import dataclass, field
@@ -22,6 +25,14 @@ from datetime import datetime
 from ..core.models import GeminiClient
 from ..rlm.engine import RLMEngine, RLMConfig
 from ..rlm.state import InvestigationState, ThinkingStep, Citation, StepType
+from ..service.config import ServiceConfig
+
+logger = logging.getLogger(__name__)
+
+
+def get_storage_mode() -> str:
+    """Get storage mode from environment."""
+    return os.getenv("IRYS_STORAGE_MODE", "local")
 
 
 @dataclass
