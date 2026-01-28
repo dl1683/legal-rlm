@@ -1241,7 +1241,7 @@ Query: {state.query}
         if pinned_content_parts:
             self._emit_step(
                 state,
-                StepType.INFO,
+                StepType.FINDING,
                 f"Loaded {docs_loaded} decisive document(s) for synthesis"
             )
 
