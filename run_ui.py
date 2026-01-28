@@ -1,4 +1,8 @@
-"""Launch the RLM UI."""
+"""Launch the RLM Multi-Turn Chat UI.
+
+This is the main entry point for the Irys RLM user interface.
+Uses the multi-turn chat interface for conversational document analysis.
+"""
 import sys
 import os
 from pathlib import Path
@@ -20,8 +24,8 @@ except ImportError:
     print("[WARN] python-dotenv not installed. Install with: pip install python-dotenv")
     print("   Falling back to system environment variables...")
 
-# Now import after env is loaded
-from irys.ui.app import create_app
+# Now import after env is loaded - use multi-turn chat UI
+from irys.ui.chat_app import create_chat_app
 
 
 if __name__ == "__main__":
@@ -37,6 +41,7 @@ if __name__ == "__main__":
 
     print(f"[OK] API key loaded: {api_key[:20]}...")
 
-    app = create_app(api_key=api_key)
-    print("\n[START] Launching Irys RLM UI on http://localhost:7862")
-    app.launch(server_port=7862)
+    app = create_chat_app(api_key=api_key)
+    port = int(os.environ.get("GRADIO_SERVER_PORT", 7863))
+    print(f"\n[START] Launching Irys RLM Multi-Turn Chat UI on http://localhost:{port}")
+    app.launch(server_port=port)
