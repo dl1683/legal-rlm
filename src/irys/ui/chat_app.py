@@ -724,29 +724,67 @@ def browse_folder() -> str:
 
 
 def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
-    """Create the multi-turn chat Gradio application."""
+    """Create the multi-turn chat Gradio application.
+
+    The UI adapts based on IRYS_STORAGE_MODE:
+    - "local": Shows folder browser for local file system
+    - "s3" or other: Shows file upload component for cloud storage
+    """
     app = ChatApp(api_key=api_key)
+    storage_mode = get_storage_mode()
+    is_local_mode = storage_mode == "local"
 
     with gr.Blocks(
         title="Irys RLM - Legal Document Chat",
     ) as demo:
         gr.Markdown("# Irys RLM - Legal Document Chat")
-        gr.Markdown(
-            "Select a document repository and have a conversation about it. "
-            "Ask follow-up questions - the system remembers your conversation."
-        )
+
+        if is_local_mode:
+            gr.Markdown(
+                "Select a document repository and have a conversation about it. "
+                "Ask follow-up questions - the system remembers your conversation."
+            )
+        else:
+            gr.Markdown(
+                "Upload your legal documents and have a conversation about them. "
+                "Ask follow-up questions - the system remembers your conversation."
+            )
 
         with gr.Row():
             # Left column: Chat
             with gr.Column(scale=2):
-                # Repository selector
-                with gr.Row():
-                    repo_path = gr.Textbox(
-                        label="Repository Path",
-                        placeholder="Select a folder containing legal documents...",
-                        scale=4,
-                    )
-                    browse_btn = gr.Button("Browse", scale=1)
+                if is_local_mode:
+                    # Local mode: folder browser
+                    with gr.Row():
+                        repo_path = gr.Textbox(
+                            label="Repository Path",
+                            placeholder="Select a folder containing legal documents...",
+                            scale=4,
+                        )
+                        browse_btn = gr.Button("Browse", scale=1)
+                else:
+                    # S3/Cloud mode: file upload tabs
+                    with gr.Tabs():
+                        with gr.TabItem("Upload Files"):
+                            file_upload = gr.File(
+                                label="Upload Individual Documents",
+                                file_count="multiple",
+                                file_types=[".pdf", ".docx", ".doc", ".txt", ".rtf", ".mht"],
+                                type="filepath",
+                            )
+                            gr.Markdown(
+                                "*Select one or more files. Supported formats: PDF, DOCX, DOC, TXT, RTF, MHT*",
+                            )
+                        with gr.TabItem("Upload Folder"):
+                            folder_upload = gr.File(
+                                label="Upload Document Folder",
+                                file_count="directory",
+                                type="filepath",
+                            )
+                            gr.Markdown(
+                                "*Select a folder to upload all documents including subfolders. "
+                                "Folder structure will be preserved.*",
+                            )
 
                 # Chat interface (Gradio 6.x uses messages format by default)
                 chatbot = gr.Chatbot(
@@ -804,39 +842,61 @@ def create_chat_app(api_key: Optional[str] = None) -> gr.Blocks:
             inputs=[msg],
         )
 
-        # Event handlers
-        browse_btn.click(
-            fn=browse_folder,
-            outputs=[repo_path],
-        )
+        # Event handlers - wired based on storage mode
+        if is_local_mode:
+            # Local mode: folder browser
+            browse_btn.click(
+                fn=browse_folder,
+                outputs=[repo_path],
+            )
 
-        # Submit on button click
-        submit_btn.click(
-            fn=app.chat,
-            inputs=[msg, chatbot, repo_path],
-            outputs=[chatbot, thinking, citations, status],
-        ).then(
-            fn=lambda: "",  # Clear input after submit
-            outputs=[msg],
-        )
+            # Submit on button click
+            submit_btn.click(
+                fn=app.chat,
+                inputs=[msg, chatbot, repo_path],
+                outputs=[chatbot, thinking, citations, status],
+            ).then(
+                fn=lambda: "",  # Clear input after submit
+                outputs=[msg],
+            )
 
-        # Submit on Enter
-        msg.submit(
-            fn=app.chat,
-            inputs=[msg, chatbot, repo_path],
-            outputs=[chatbot, thinking, citations, status],
-        ).then(
-            fn=lambda: "",
-            outputs=[msg],
-        )
+            # Submit on Enter
+            msg.submit(
+                fn=app.chat,
+                inputs=[msg, chatbot, repo_path],
+                outputs=[chatbot, thinking, citations, status],
+            ).then(
+                fn=lambda: "",
+                outputs=[msg],
+            )
+        else:
+            # S3/Cloud mode: file upload
+            submit_btn.click(
+                fn=app.chat_with_upload,
+                inputs=[msg, chatbot, file_upload, folder_upload],
+                outputs=[chatbot, thinking, citations, status],
+            ).then(
+                fn=lambda: "",  # Clear input after submit
+                outputs=[msg],
+            )
 
-        # Clear chat
+            # Submit on Enter
+            msg.submit(
+                fn=app.chat_with_upload,
+                inputs=[msg, chatbot, file_upload, folder_upload],
+                outputs=[chatbot, thinking, citations, status],
+            ).then(
+                fn=lambda: "",
+                outputs=[msg],
+            )
+
+        # Clear chat (same for both modes)
         clear_btn.click(
             fn=app.clear_chat,
             outputs=[chatbot, thinking, citations, status],
         )
 
-        # Stop investigation
+        # Stop investigation (same for both modes)
         stop_btn.click(
             fn=app.stop_investigation,
             outputs=[status],
