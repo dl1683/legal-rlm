@@ -512,22 +512,6 @@ Query: {state.query}
                 except Exception as e:
                     logger.warning(f"Case law search failed for '{query}': {e}")
 
-            # Analyze case law results (results are dicts from to_dict())
-            if self._external_research["case_law"]:
-                case_law_text = "\n\n".join([
-                    f"**{c.get('case_name', 'Unknown')}** ({c.get('citation') or 'No citation'})\n"
-                    f"Court: {c.get('court', 'Unknown')}\nDate: {c.get('date_filed', 'Unknown')}\n"
-                    f"Snippet: {(c.get('snippet') or c.get('opinion_text', ''))[:500] if c.get('snippet') or c.get('opinion_text') else 'No summary'}"
-                    for c in self._external_research["case_law"][:5]
-                ])
-
-                analysis = await decisions.analyze_case_law_results(
-                    query=state.query,
-                    case_law_results=case_law_text,
-                    client=self.client,
-                )
-                self._external_research["analysis"]["case_law"] = analysis
-
         # Execute web searches
         if web_queries and self.external_search:
             self._emit_step(
@@ -557,20 +541,47 @@ Query: {state.query}
                 except Exception as e:
                     logger.warning(f"Web search failed for '{query}': {e}")
 
-            # Analyze web results (results are dicts)
-            if self._external_research["web"]:
+        # CONSOLIDATED: Analyze all external results in one call
+        if self._external_research.get("case_law") or self._external_research.get("web"):
+            # Format case law results
+            case_law_text = ""
+            if self._external_research.get("case_law"):
+                case_law_text = "\n\n".join([
+                    f"**{c.get('case_name', 'Unknown')}** ({c.get('citation') or 'No citation'})\n"
+                    f"Court: {c.get('court', 'Unknown')}\nDate: {c.get('date_filed', 'Unknown')}\n"
+                    f"Snippet: {(c.get('snippet') or c.get('opinion_text', ''))[:500] if c.get('snippet') or c.get('opinion_text') else 'No summary'}"
+                    for c in self._external_research["case_law"][:5]
+                ])
+
+            # Format web results
+            web_text = ""
+            if self._external_research.get("web"):
                 web_text = "\n\n".join([
                     f"**{r.get('title', 'Untitled')}**\nURL: {r.get('url', '')}\n"
                     f"Content: {r.get('content', 'No content')[:500]}"
                     for r in self._external_research["web"][:5]
                 ])
 
-                analysis = await decisions.analyze_web_results(
-                    query=state.query,
-                    web_results=web_text,
-                    client=self.client,
-                )
-                self._external_research["analysis"]["web"] = analysis
+            # Single consolidated call replaces analyze_case_law_results + analyze_web_results
+            analysis = await decisions.analyze_external(
+                query=state.query,
+                case_law_results=case_law_text,
+                web_results=web_text,
+                client=self.client,
+            )
+
+            # Store analysis in both locations for backwards compatibility
+            self._external_research["analysis"]["case_law"] = {
+                "key_precedents": analysis.get("key_precedents", []),
+                "legal_standards": analysis.get("legal_standards", []),
+                "summary": analysis.get("summary", ""),
+            }
+            self._external_research["analysis"]["web"] = {
+                "regulations": analysis.get("regulations", []),
+                "standards": analysis.get("regulatory_standards", []),
+                "summary": analysis.get("summary", ""),
+            }
+            self._external_research["analysis"]["combined"] = analysis.get("combined_framework", "")
 
         # Store in state findings for reference
         state.findings["external_research"] = self._external_research
@@ -641,19 +652,20 @@ Query: {state.query}
             iteration += 1
             facts_count = len(state.findings.get("accumulated_facts", []))
             findings_summary = self._format_findings(state)
+            plan_summary = state.findings.get("initial_plan", {}).get("reasoning", "")
 
-            # === RECALIBRATION POINT ===
-            # After each iteration, reassess our approach like a lawyer would
-
-            # 1. Check if we have enough to answer
-            if facts_count >= self.config.early_exit_facts:
-                is_sufficient = await decisions.is_sufficient(
+            # === CONSOLIDATED CHECKPOINT ===
+            # Single LLM call replaces is_sufficient + should_replan
+            if facts_count >= self.config.early_exit_facts or iteration > 1:
+                checkpoint_result = await decisions.checkpoint(
                     query=state.query,
                     findings=findings_summary,
+                    plan=plan_summary,
                     client=self.client,
                 )
 
-                if is_sufficient:
+                # Check sufficiency
+                if checkpoint_result.get("sufficient"):
                     self._emit_step(
                         state,
                         StepType.THINKING,
@@ -661,66 +673,32 @@ Query: {state.query}
                     )
                     break
 
-            # 2. Continuous replanning - check if we should change approach
-            # For complex queries, replan frequently based on what we're finding
-            prev_facts_count = state.findings.get("_prev_facts_count", 0)
-            facts_delta = facts_count - prev_facts_count
-            state.findings["_prev_facts_count"] = facts_count
-
-            # Replan if:
-            # - We're not finding new facts (stalled)
-            # - Every iteration for complex queries
-            # - Every 2 iterations for simpler queries
-            is_complex = state.query_classification.get('complexity', 3) >= 3
-            is_stalled = facts_delta < 2 and iteration > 1
-            should_check_replan = is_stalled or (is_complex and iteration > 0) or (iteration > 1 and iteration % 2 == 0)
-
-            if should_check_replan and pending_leads:  # Only replan if we still have work to do
-                plan_summary = state.findings.get("initial_plan", {}).get("reasoning", "")
-                should_change = await decisions.should_replan(
-                    query=state.query,
-                    plan=plan_summary,
-                    results=findings_summary,
-                    client=self.client,
-                )
-
-                if should_change:
+                # Handle replanning if needed
+                if checkpoint_result.get("should_replan") and pending_leads:
+                    progress = checkpoint_result.get("progress_assessment", "")
                     self._emit_step(
                         state,
                         StepType.THINKING,
-                        f"Recalibrating... (stalled={is_stalled}, complex={is_complex})",
-                    )
-                    new_plan = await decisions.replan(
-                        query=state.query,
-                        previous_approach=plan_summary,
-                        findings=findings_summary,
-                        client=self.client,
+                        f"Recalibrating... {progress[:50]}",
                     )
 
-                    # Add new leads from replanning
+                    # Add new leads from checkpoint
                     new_leads_added = 0
-                    for term in new_plan.get("search_terms", [])[:3]:
+                    for term in checkpoint_result.get("new_search_terms", [])[:3]:
                         if not cache.is_similar_search(term):
-                            state.add_lead(f"Search for: {term}", source="replan")
+                            state.add_lead(f"Search for: {term}", source="checkpoint")
                             new_leads_added += 1
-                    for filepath in new_plan.get("files_to_check", [])[:2]:
+                    for filepath in checkpoint_result.get("files_to_check", [])[:2]:
                         if not cache.has_extracted(filepath):
-                            state.add_lead(f"Read document: {filepath}", source="replan")
+                            state.add_lead(f"Read document: {filepath}", source="checkpoint")
                             new_leads_added += 1
 
                     if new_leads_added > 0:
                         self._emit_step(
                             state,
                             StepType.THINKING,
-                            f"Added {new_leads_added} new leads from replanning",
+                            f"Added {new_leads_added} new leads from checkpoint",
                         )
-
-                    # Check if replanning suggests external research
-                    if new_plan.get("needs_external_research") and not external_search_triggered:
-                        if "initial_plan" not in state.findings:
-                            state.findings["initial_plan"] = {}
-                        state.findings["initial_plan"]["case_law_searches"] = new_plan.get("case_law_searches", [])
-                        state.findings["initial_plan"]["web_searches"] = new_plan.get("web_searches", [])
 
             # 3. Dynamic external search - trigger if we discover we need it
             # (e.g., found references to case law, regulations, state-specific rules)
@@ -850,36 +828,28 @@ Query: {state.query}
                 f"Found {len(results.hits)} matches",
             )
 
-            # OPTIMIZATION: Skip LLM call if <= 15 results (long-context LLMs handle this fine)
-            if len(results.hits) <= 15:
-                relevant_hits = results.hits
-                logger.info(f"Skipping pick_relevant_hits: only {len(results.hits)} results")
-            else:
-                # Let LLM pick the most relevant hits
-                relevant_hits = await decisions.pick_relevant_hits(
-                    query=state.query,
-                    results=results,
-                    client=self.client,
-                )
-
-            # Analyze results and read docs (with caching)
-            await self._analyze_results(state, repo, results, relevant_hits, cache)
+            # CONSOLIDATED: Single analyze_search call replaces pick_relevant_hits + analyze_results + prioritize_documents
+            await self._analyze_results_consolidated(state, repo, results, cache)
 
             state.mark_lead_investigated(lead.id, f"Found {len(results.hits)} matches")
 
-    async def _analyze_results(
+    async def _analyze_results_consolidated(
         self,
         state: InvestigationState,
         repo: MatterRepository,
         results: SearchResults,
-        relevant_hits: list,
         cache: InvestigationCache,
     ):
-        """Analyze search results using LLM."""
-        # Use decisions layer to analyze
-        analysis = await decisions.analyze_results(
+        """Consolidated search analysis - single FLASH call replaces 3 separate calls."""
+        key_issues = state.findings.get("issues", [])
+        already_read = list(cache.extracted_docs)
+
+        # Single consolidated call: pick_relevant_hits + analyze_results + prioritize_documents
+        analysis = await decisions.analyze_search(
             query=state.query,
+            key_issues=key_issues,
             results=results,
+            already_read=already_read,
             client=self.client,
         )
 
@@ -887,7 +857,8 @@ Query: {state.query}
         facts = analysis.get("facts", [])
         state.add_facts(facts)
 
-        # Add citations from relevant hits (limit to 3)
+        # Add citations from relevant hits
+        relevant_hits = analysis.get("relevant_hits", [])
         for hit in relevant_hits[:3]:
             citation = state.add_citation(
                 document=hit.file_path,
@@ -899,36 +870,38 @@ Query: {state.query}
             if citation and self.on_citation:
                 self.on_citation(citation)
 
-        # OPTIMIZATION: Only add leads for docs we haven't extracted
+        # Add leads for docs to read deeper
         for filepath in analysis.get("read_deeper", [])[:2]:
             if isinstance(filepath, str) and not cache.has_extracted(filepath):
                 state.add_lead(f"Read document: {filepath}", source="analysis")
 
-        # OPTIMIZATION: Limit additional searches
+        # Add additional search leads
         for term in analysis.get("additional_searches", [])[:1]:
             if isinstance(term, str) and not cache.is_similar_search(term):
                 state.add_lead(f"Search for: {term}", source="analysis")
 
-        # Get candidate files from search results
-        candidate_files = list(results.by_file().keys())
+        # Get prioritized files from the consolidated analysis
+        ranked_docs = analysis.get("ranked_documents", [])
 
-        # OPTIMIZATION: Dynamic document prioritization using LLM
-        if candidate_files:
-            key_issues = state.findings.get("issues", [])
-            already_read = list(cache.extracted_docs)
+        # Filter to unread, non-irrelevant files and extract top ones
+        top_files = []
+        for doc in ranked_docs:
+            filepath = doc.get("file") if isinstance(doc, dict) else doc
+            criticality = doc.get("criticality", "SUPPORTING") if isinstance(doc, dict) else "SUPPORTING"
 
-            prioritized_files = await decisions.prioritize_documents(
-                query=state.query,
-                candidate_files=candidate_files,
-                already_read=already_read,
-                key_issues=key_issues,
-                client=self.client,
-            )
+            # Skip irrelevant documents
+            if criticality == "IRRELEVANT":
+                continue
 
-            # Filter to unread files only
-            top_files = [f for f in prioritized_files if not cache.has_extracted(f)]
-        else:
-            top_files = []
+            if filepath and not cache.has_extracted(filepath):
+                top_files.append(filepath)
+
+                # Mark DECISIVE documents for potential pinning
+                if criticality == "DECISIVE":
+                    if "pinned_documents" not in state.findings:
+                        state.findings["pinned_documents"] = []
+                    if filepath not in state.findings["pinned_documents"]:
+                        state.findings["pinned_documents"].append(filepath)
 
         await self._batch_read(state, repo, top_files[:self.config.parallel_reads], cache)
 
