@@ -434,7 +434,7 @@ class RLMEngine:
         """Phase 1: Create investigation plan using LLM."""
         stats = repo.get_stats()
 
-        self._emit_step(state, StepType.THINKING, f"Analyzing: {stats.total_files} files, {stats.total_size_kb:,}KB across {stats.folder_count} folders")
+        self._emit_step(state, StepType.THINKING, f"Analyzing: {stats.total_files} files across {stats.folder_count} folders")
         file_list = repo.get_file_list()
 
         # Format file list for LLM - show filenames so it can prioritize
