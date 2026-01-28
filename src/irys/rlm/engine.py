@@ -110,6 +110,7 @@ class RLMEngine:
         # Initialize external search manager (enabled by default)
         self.external_search = ExternalSearchManager() if self.config.enable_external_search else None
         self._external_research: dict = {}  # Store external research results
+        self.repo: Optional[MatterRepository] = None  # Set during investigate()
 
     async def investigate(
         self,
@@ -118,6 +119,8 @@ class RLMEngine:
     ) -> InvestigationState:
         """Run full recursive investigation."""
         repo = MatterRepository(repository_path)
+        self.repo = repo  # Store for methods that need repo access (e.g., _load_pinned_documents)
+        self._external_research = {}  # Reset external research for this investigation
         state = InvestigationState.create(query, str(repository_path))
         cache = InvestigationCache()
 
@@ -1191,29 +1194,45 @@ Query: {state.query}
         if not pinned_docs:
             return ""
 
+        # Safety check - repo must be set
+        if not self.repo:
+            logger.warning("Cannot load pinned documents - repo not initialized")
+            return ""
+
         TOTAL_BUDGET = 100_000  # 100k total budget
         MAX_PER_DOC = 30_000   # Max 30k per document
+        HEADER_OVERHEAD = 50   # Approximate overhead for "=== DECISIVE: filename ===" header
 
         pinned_content_parts = []
         budget_remaining = TOTAL_BUDGET
         docs_loaded = 0
+        seen_files = set()  # Deduplicate pinned docs
 
         for filepath in pinned_docs:
-            if budget_remaining <= 0:
-                logger.info(f"Pinned document budget exhausted, skipping remaining {len(pinned_docs) - docs_loaded} docs")
+            # Skip duplicates
+            if filepath in seen_files:
+                continue
+            seen_files.add(filepath)
+
+            if budget_remaining <= HEADER_OVERHEAD:
+                logger.info(f"Pinned document budget exhausted, skipping remaining docs")
                 break
 
             try:
                 doc = self.repo.read(filepath)
                 if doc:
                     # Get excerpt respecting both per-doc and remaining budget limits
-                    max_chars = min(MAX_PER_DOC, budget_remaining)
+                    # Account for header overhead in budget
+                    max_chars = min(MAX_PER_DOC, budget_remaining - HEADER_OVERHEAD)
+                    if max_chars <= 0:
+                        break
                     excerpt = doc.get_excerpt(max_chars)
 
                     if excerpt:
                         filename = doc.filename or filepath.split("/")[-1].split("\\")[-1]
-                        pinned_content_parts.append(f"\n=== DECISIVE: {filename} ===\n{excerpt}")
-                        budget_remaining -= len(excerpt)
+                        header = f"\n=== DECISIVE: {filename} ===\n"
+                        pinned_content_parts.append(f"{header}{excerpt}")
+                        budget_remaining -= (len(header) + len(excerpt))
                         docs_loaded += 1
                         logger.info(f"Loaded pinned document: {filename} ({len(excerpt)} chars)")
             except Exception as e:
