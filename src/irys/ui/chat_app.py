@@ -220,7 +220,8 @@ class ChatApp:
                 if update_type == "thinking":
                     elapsed = time.time() - start_time
                     status = f"Investigating... ({elapsed:.1f}s) - {len(self.current_thinking)} steps"
-                    thinking_display = "\n".join(self.current_thinking[-20:])  # Last 20 steps
+                    # Show all steps - they're now more informative so we want to see them all
+                    thinking_display = "\n".join(self.current_thinking)
                     citations_display = "\n".join(self.current_citations) or "Finding sources..."
 
                     # Update assistant placeholder with progress
@@ -230,7 +231,7 @@ class ChatApp:
                 elif update_type == "citation":
                     # Update citations display
                     citations_display = "\n".join(self.current_citations)
-                    yield history, "\n".join(self.current_thinking[-20:]), citations_display, f"Found {len(self.current_citations)} citations"
+                    yield history, "\n".join(self.current_thinking), citations_display, f"Found {len(self.current_citations)} citations"
 
                 elif update_type == "complete":
                     self.is_running = False
@@ -274,7 +275,7 @@ class ChatApp:
                 # Keep UI responsive
                 if self.current_thinking:
                     elapsed = time.time() - start_time
-                    thinking_display = "\n".join(self.current_thinking[-20:])
+                    thinking_display = "\n".join(self.current_thinking)
                     citations_display = "\n".join(self.current_citations) or "Finding sources..."
                     yield history, thinking_display, citations_display, f"Investigating... ({elapsed:.1f}s)"
 
