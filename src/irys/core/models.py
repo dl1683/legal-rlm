@@ -149,12 +149,12 @@ MODEL_CONFIGS: dict[ModelTier, ModelConfig] = {
         cost_per_1m_output=0.40,
     ),
     ModelTier.FLASH: ModelConfig(
-        model_id="gemini-2.5-flash",  # Can switch to gemini-3-flash when ready
-        thinking_level="",  # Set to "medium" or "high" for 3-flash thinking
+        model_id="gemini-3.0-flash",  # Upgraded from gemini-2.5-flash
+        thinking_level="medium",  # Enable thinking for better reasoning
         temperature=0.0,  # Deterministic for consistency
         max_output_tokens=32768,  # Strategic decisions need room
-        cost_per_1m_input=0.30,
-        cost_per_1m_output=2.50,
+        cost_per_1m_input=0.50,  # Updated pricing for 3.0
+        cost_per_1m_output=3.00,
     ),
     ModelTier.PRO: ModelConfig(
         model_id="gemini-2.5-pro",
