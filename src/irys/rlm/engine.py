@@ -205,13 +205,12 @@ class RLMEngine:
         Direct answer mode for small repositories.
 
         Skips: Complex RLM loop (leads, iterations, replanning, context management)
-        Keeps: External search tools (case law, web) when query needs them
+        Keeps: External search tools (case law, web) with iterative refinement
 
         Flow:
         1. Load all documents directly (no search needed - small enough)
-        2. Create plan to determine if external research is needed
-        3. Execute external searches if needed
-        4. Synthesize answer from all sources
+        2. Extract triggers and do external research (with iteration)
+        3. Use same _synthesize() as large repos for consistency
         """
         self._emit_step(state, StepType.READING, "Loading all documents...")
 
@@ -219,43 +218,58 @@ class RLMEngine:
         all_content = repo.get_all_content()
         state.documents_read = len(repo.list_files())
 
+        # Store all content for synthesis (small repo = all docs are "pinned")
+        state.findings["small_repo_content"] = all_content
+
         self._emit_step(
             state,
             StepType.FINDING,
             f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
         )
 
-        # For small repos, do a quick trigger extraction before deciding on external search
+        # Track executed queries for iterative external research
+        executed_external_queries: set[str] = set()
+
+        # External research with iteration (up to 2 rounds)
         if self.config.enable_external_search and self.external_search:
-            self._emit_step(state, StepType.THINKING, "Scanning content for research triggers...")
-
-            # Quick LITE call to extract triggers from loaded content
-            triggers_result = await decisions.extract_triggers_from_content(
-                content=all_content,
-                client=self.client,
-            )
-
-            # Accumulate triggers into state
-            state.add_triggers(triggers_result)
-
-            # Check if meaningful triggers were found
-            if state.has_external_triggers(min_triggers=2):
-                triggers_summary = state.get_trigger_summary()
+            for research_round in range(2):
                 self._emit_step(
                     state,
                     StepType.THINKING,
-                    f"Research triggers found: {triggers_summary[:100]}...",
+                    f"External research round {research_round + 1}...",
                 )
 
-                # Extract entity names from content for context
+                # Extract triggers from content
+                triggers_result = await decisions.extract_triggers_from_content(
+                    content=all_content,
+                    client=self.client,
+                )
+                state.add_triggers(triggers_result)
+
+                if not state.has_external_triggers(min_triggers=2):
+                    self._emit_step(state, StepType.THINKING, "No external research triggers found")
+                    break
+
+                triggers_summary = state.get_trigger_summary()
+
+                # Extract entities for context
                 content_sample = all_content[:5000]
                 potential_entities = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
                 quick_entities = list(set(potential_entities))[:10]
 
-                # Generate specific queries using triggers
+                # Include what we've found so far for better query generation
+                current_research_summary = ""
+                if self._external_research.get("case_law"):
+                    cases = [c.get("case_name", "") for c in self._external_research["case_law"][:3]]
+                    current_research_summary += f"Case law found: {', '.join(cases)}\n"
+                if self._external_research.get("web"):
+                    titles = [r.get("title", "") for r in self._external_research["web"][:3]]
+                    current_research_summary += f"Web results found: {', '.join(titles)}\n"
+
+                # Generate queries (will get different ones on round 2 based on context)
                 result = await decisions.generate_external_queries(
-                    query=state.query,
-                    facts=[],
+                    query=state.query + (f"\n\nAlready researched:\n{current_research_summary}" if current_research_summary else ""),
+                    facts=state.findings.get("accumulated_facts", [])[:5],
                     entities=quick_entities,
                     client=self.client,
                     triggers=triggers_summary,
@@ -264,100 +278,73 @@ class RLMEngine:
                 case_law_queries = result.get("case_law_queries", [])
                 web_queries = result.get("web_queries", [])
 
-                if case_law_queries or web_queries:
-                    state.findings["initial_plan"] = {
-                        "case_law_searches": case_law_queries,
-                        "web_searches": web_queries,
-                    }
-                    self._emit_step(
-                        state,
-                        StepType.THINKING,
-                        f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
-                    )
-                    await self._execute_external_searches(state)
+                # Filter out already-executed queries
+                new_case_law = [q for q in case_law_queries if q not in executed_external_queries]
+                new_web = [q for q in web_queries if q not in executed_external_queries]
 
-        # Compile external research if any and add citations
-        external_text = ""
-        if self._external_research:
-            formatted = self._format_external_research()
-            if formatted.get("case_law"):
-                external_text += f"\n\n=== CASE LAW ===\n{formatted['case_law']}"
+                if not new_case_law and not new_web:
+                    self._emit_step(state, StepType.THINKING, "No new external queries to execute")
+                    break
 
-                # Add citations for case law
-                for case in self._external_research.get("case_law", [])[:5]:
-                    citation = state.add_citation(
-                        document=f"[Case Law] {case.get('case_name', 'Unknown Case')}",
-                        page=None,
-                        text=case.get('snippet', '') or '',
-                        context=f"Citation: {case.get('citation', 'N/A')} | Court: {case.get('court', 'N/A')}",
-                        relevance="External case law research",
-                    )
-                    if citation and self.on_citation:
-                        self.on_citation(citation)
+                # Track and execute
+                executed_external_queries.update(new_case_law)
+                executed_external_queries.update(new_web)
 
-            if formatted.get("web"):
-                external_text += f"\n\n=== REGULATIONS/STANDARDS ===\n{formatted['web']}"
+                state.findings["initial_plan"] = {
+                    "case_law_searches": new_case_law,
+                    "web_searches": new_web,
+                }
 
-                # Add citations for web results
-                for result in self._external_research.get("web", [])[:5]:
-                    citation = state.add_citation(
-                        document=f"[Web] {result.get('title', 'Unknown Source')}",
-                        page=None,
-                        text=result.get('content', '') or '',
-                        context=f"URL: {result.get('url', 'N/A')}",
-                        relevance="External regulatory research",
-                    )
-                    if citation and self.on_citation:
-                        self.on_citation(citation)
+                self._emit_step(
+                    state,
+                    StepType.THINKING,
+                    f"Round {research_round + 1}: {len(new_case_law)} case law + {len(new_web)} web queries",
+                )
 
-        # Include any prior learnings from this repo
-        learnings = repo.get_learnings(5)
-        learnings_context = ""
-        if learnings:
-            learnings_context = "\n\nPrior learnings from this repository:\n" + "\n".join(
-                f"- Q: {l['query'][:50]}... -> {l['finding'][:100]}..." for l in learnings
-            )
+                await self._execute_external_searches(state)
 
-        # Synthesize answer from all sources
-        self._emit_step(state, StepType.SYNTHESIS, "Analyzing all sources...")
+                # After first round, check if we got useful results
+                if research_round == 0:
+                    has_results = bool(self._external_research.get("case_law") or self._external_research.get("web"))
+                    if not has_results:
+                        self._emit_step(state, StepType.THINKING, "No external results found, skipping round 2")
+                        break
 
-        # Adjust instructions based on whether query explicitly asks for external research
-        query_lower = state.query.lower()
-        asks_for_external = any(term in query_lower for term in [
-            'case law', 'precedent', 'regulation', 'regulatory', 'guidance', 'legal standard'
-        ])
+        # Add citations for external research
+        self._add_external_citations(state)
 
-        if asks_for_external and external_text:
-            instructions = """INSTRUCTIONS:
-1. The query asks for EXTERNAL LEGAL RESEARCH - prioritize the CASE LAW and REGULATIONS sections
-2. Cite specific cases with their citations (e.g., "Horror Inc. v. Miller, 335 F. Supp. 3d 273")
-3. Reference specific regulations and their requirements
-4. Connect external research to the case documents where relevant
-5. If case law or regulations are limited, acknowledge that"""
-        else:
-            instructions = """INSTRUCTIONS:
-1. Answer based primarily on the CASE DOCUMENTS
-2. Support with case law and regulations if provided
-3. Cite specific sources for each fact
-4. Be precise with names, dates, amounts, and legal terms"""
-
-        response = await self.client.complete(
-            f"""You are a senior legal analyst. Answer this query using all provided sources.
-
-Query: {state.query}
-
-=== CASE DOCUMENTS ===
-{all_content}
-{external_text}
-{learnings_context}
-
-{instructions}""",
-            tier=ModelTier.FLASH,
-        )
-
-        state.findings["final_output"] = response
+        # Use the same synthesis as large repos - respects SIMPLE/COMPLEX classification
         state.findings["mode"] = "direct_answer"
-        self._emit_step(state, StepType.SYNTHESIS, "Analysis complete")
+        await self._synthesize(state, self._is_simple_query)
+
+    def _add_external_citations(self, state: InvestigationState):
+        """Add citations for external research results."""
+        if not self._external_research:
+            return
+
+        # Add citations for case law
+        for case in self._external_research.get("case_law", [])[:5]:
+            citation = state.add_citation(
+                document=f"[Case Law] {case.get('case_name', 'Unknown Case')}",
+                page=None,
+                text=case.get('snippet', '') or '',
+                context=f"Citation: {case.get('citation', 'N/A')} | Court: {case.get('court', 'N/A')}",
+                relevance="External case law research",
+            )
+            if citation and self.on_citation:
+                self.on_citation(citation)
+
+        # Add citations for web results
+        for result in self._external_research.get("web", [])[:5]:
+            citation = state.add_citation(
+                document=f"[Web] {result.get('title', 'Unknown Source')}",
+                page=None,
+                text=result.get('content', '') or '',
+                context=f"URL: {result.get('url', 'N/A')}",
+                relevance="External regulatory research",
+            )
+            if citation and self.on_citation:
+                self.on_citation(citation)
 
     def _format_external_research(self) -> dict[str, str]:
         """Format external research results for synthesis prompts.
@@ -1164,13 +1151,13 @@ Query: {state.query}
             self._emit_step(state, StepType.ERROR, f"Failed to read {file_path}: {e}")
 
     async def _synthesize(self, state: InvestigationState, is_simple: bool = False):
-        """Phase 3: Final synthesis using ALL THREE sources.
+        """Phase 3: Final synthesis using ALL sources.
 
         Sources:
-        1. Local document search (facts and citations from repo)
+        1. Local document evidence (facts extracted during investigation)
         2. Case law search (CourtListener)
         3. Web search (Tavily - regulations/standards)
-        4. Pinned DECISIVE documents (full content)
+        4. Pinned DECISIVE documents OR small repo full content
         """
         self._emit_step(state, StepType.SYNTHESIS, "Synthesizing from all sources...")
 
@@ -1179,8 +1166,15 @@ Query: {state.query}
         evidence = "\n".join(f"- {fact}" for fact in facts[:20])
         citations = state.get_citations_formatted()
 
-        # SOURCE 4: Load DECISIVE pinned document content
-        pinned_content = await self._load_pinned_documents(state)
+        # SOURCE 4: Pinned content - either from small repo (all docs) or DECISIVE docs
+        small_repo_content = state.findings.get("small_repo_content")
+        if small_repo_content:
+            # Small repo mode - all content already loaded
+            pinned_content = f"=== ALL REPOSITORY DOCUMENTS ===\n{small_repo_content}"
+            logger.info(f"Using small repo content: {len(small_repo_content)} chars")
+        else:
+            # Large repo mode - load DECISIVE pinned documents
+            pinned_content = await self._load_pinned_documents(state)
 
         # SOURCES 2 & 3: External research (case law + web)
         external_formatted = self._format_external_research()
