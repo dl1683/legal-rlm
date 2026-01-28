@@ -79,12 +79,15 @@ class ChatSession:
 class ChatApp:
     """Multi-turn chat application for Irys RLM."""
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, config: Optional[ServiceConfig] = None):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        self.config = config or ServiceConfig.from_env()
+        self.storage_mode = get_storage_mode()
         self.session: Optional[ChatSession] = None
         self.update_queue: queue.Queue = queue.Queue()
         self.is_running = False
         self.stop_requested = False  # Flag to stop investigation midway
+        self._temp_dirs: dict[str, Path] = {}  # Track temp dirs for cleanup
 
         # Current turn state
         self.current_thinking: list[str] = []
