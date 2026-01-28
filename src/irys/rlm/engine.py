@@ -120,7 +120,7 @@ class RLMEngine:
         """Run full recursive investigation."""
         repo = MatterRepository(repository_path)
         self.repo = repo  # Store for methods that need repo access (e.g., _load_pinned_documents)
-        self._external_research = {}  # Reset external research for this investigation
+        self._external_research = {"case_law": [], "web": [], "analysis": {}}  # Reset with proper structure
         state = InvestigationState.create(query, str(repository_path))
         cache = InvestigationCache()
 
