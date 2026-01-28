@@ -318,6 +318,9 @@ P_SYNTHESIZE = """You are a senior legal analyst preparing a response to a query
 
 Query: {query}
 
+=== DECISIVE DOCUMENTS (Full Content) ===
+{pinned_content}
+
 === CASE-SPECIFIC EVIDENCE ===
 {evidence}
 
@@ -327,8 +330,10 @@ Query: {query}
 === CITATIONS ===
 {citations}
 
+IMPORTANT: PRIORITIZE information from the DECISIVE DOCUMENTS section - these are the most critical sources for answering this query. They have been identified as directly relevant and their full content is provided above.
+
 Write a clear, well-organized response that:
-1. Directly answers the query based on case-specific evidence
+1. Directly answers the query, prioritizing DECISIVE document content
 2. Supports legal conclusions with relevant case law and regulations when available
 3. Cites specific sources for each claim (both case documents AND external sources)
 4. Distinguishes between case facts and general legal principles
@@ -346,7 +351,7 @@ Format your response with clear sections if the answer is complex."""
 P_SYNTHESIZE_SIMPLE = """Answer this factual question concisely based on the evidence.
 
 Query: {query}
-
+{pinned_content}
 Evidence:
 {evidence}
 
@@ -354,6 +359,7 @@ Sources:
 {citations}
 
 Provide a brief, direct answer (2-4 sentences). Include the key facts and cite sources.
+If DECISIVE document content is provided above, prioritize that information.
 Do not elaborate unnecessarily - just answer the question directly."""
 
 
@@ -555,4 +561,126 @@ Reply in JSON only:
     "legal_doctrines": ["specific legal doctrines referenced"],
     "industry_standards": ["specific standards mentioned"],
     "case_references": ["specific cases cited"]
+}}"""
+
+
+# =============================================================================
+# CONSOLIDATED PROMPTS (Reducing LLM calls)
+# =============================================================================
+
+P_CHECKPOINT = """Query: {query}
+
+Evidence gathered so far:
+{findings}
+
+Current approach: {plan}
+
+Evaluate the investigation status:
+
+1. SUFFICIENCY: Do we have enough evidence to answer the query?
+   - Is there direct evidence addressing the question?
+   - Are there citations from source documents?
+   - Is there enough detail for a useful answer?
+
+2. PROGRESS: Is the current approach working?
+   - Are we finding relevant information?
+   - Are we stalled or making progress?
+
+3. NEXT STEPS: If not sufficient, what should we do?
+   - Different search terms?
+   - Specific documents to read?
+   - Change strategy entirely?
+
+Reply in JSON:
+{{
+    "sufficient": true/false,
+    "should_replan": true/false,
+    "progress_assessment": "brief assessment of what's working/not working",
+    "next_steps": ["specific action 1", "specific action 2"],
+    "new_search_terms": ["term1", "term2"],
+    "files_to_check": ["file1.pdf", "file2.pdf"]
+}}"""
+
+
+P_ANALYZE_SEARCH = """You are analyzing search results for a legal investigation.
+
+Query: {query}
+
+Key issues identified:
+{key_issues}
+
+Search Results:
+{results}
+
+Already read documents:
+{already_read}
+
+Perform a COMPLETE analysis in ONE pass:
+
+1. RELEVANT HITS: Which search results are most relevant? (by number)
+2. KEY FACTS: What facts are directly relevant to the query?
+3. DOCUMENT PRIORITY: Rank candidate documents for deeper reading.
+   - Score 0-100 for relevance
+   - CRITICAL: Pleadings, correspondence, party briefs > reference materials
+   - Prioritize unread documents
+4. ADDITIONAL NEEDS: What else might help?
+
+DOCUMENT CRITICALITY:
+- Mark any document as "DECISIVE" if it appears to directly answer the query
+- Mark as "IRRELEVANT" if clearly not useful for this specific query
+- Mark as "SUPPORTING" for useful context
+
+Reply in JSON:
+{{
+    "relevant_hit_numbers": [1, 3, 5],
+    "facts": ["fact1 with exact values", "fact2"],
+    "citations": [{{"text": "quote", "source": "filename", "page": 1}}],
+    "ranked_documents": [
+        {{"file": "path/file.pdf", "score": 95, "criticality": "DECISIVE", "reason": "brief reason"}},
+        {{"file": "path/file2.pdf", "score": 70, "criticality": "SUPPORTING", "reason": "brief reason"}},
+        {{"file": "path/file3.pdf", "score": 10, "criticality": "IRRELEVANT", "reason": "brief reason"}}
+    ],
+    "additional_searches": ["term1"],
+    "read_deeper": ["file1.pdf"]
+}}"""
+
+
+P_ANALYZE_EXTERNAL = """You are analyzing external legal research results.
+
+Query context: {query}
+
+=== CASE LAW RESULTS ===
+{case_law_results}
+
+=== WEB/REGULATORY RESULTS ===
+{web_results}
+
+Analyze ALL external research in ONE pass:
+
+1. CASE LAW ANALYSIS:
+   - What legal standards or tests do these cases establish?
+   - Are there directly applicable holdings?
+   - How do they apply to our situation?
+
+2. REGULATORY ANALYSIS:
+   - What regulations or standards are relevant?
+   - What are the key requirements or thresholds?
+   - How do they apply to the current situation?
+
+3. SYNTHESIS:
+   - How do case law and regulations interact?
+   - What's the combined legal framework?
+
+Reply in JSON:
+{{
+    "key_precedents": [
+        {{"case": "Case Name", "citation": "citation", "holding": "relevant holding", "applicability": "how it applies"}}
+    ],
+    "legal_standards": ["standard 1", "standard 2"],
+    "regulations": [
+        {{"name": "Regulation Name", "source": "source", "key_requirements": "requirements"}}
+    ],
+    "regulatory_standards": ["standard 1", "standard 2"],
+    "combined_framework": "How case law and regulations together inform this situation",
+    "summary": "Brief unified summary of external legal context"
 }}"""

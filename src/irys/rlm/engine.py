@@ -1038,6 +1038,7 @@ Query: {state.query}
         1. Local document search (facts and citations from repo)
         2. Case law search (CourtListener)
         3. Web search (Tavily - regulations/standards)
+        4. Pinned DECISIVE documents (full content)
         """
         self._emit_step(state, StepType.SYNTHESIS, "Synthesizing from all sources...")
 
@@ -1046,13 +1047,19 @@ Query: {state.query}
         evidence = "\n".join(f"- {fact}" for fact in facts[:20])
         citations = state.get_citations_formatted()
 
+        # SOURCE 4: Load DECISIVE pinned document content
+        pinned_content = await self._load_pinned_documents(state)
+
         # SOURCES 2 & 3: External research (case law + web)
         external_formatted = self._format_external_research()
         case_law_text = external_formatted.get("case_law", "No case law found")
         web_text = external_formatted.get("web", "No web results found")
 
         # Track sources used
-        state.findings["sources_used"] = ["local_documents", "case_law", "web_search"]
+        sources_used = ["local_documents", "case_law", "web_search"]
+        if pinned_content:
+            sources_used.append("decisive_documents")
+        state.findings["sources_used"] = sources_used
 
         # OPTIMIZATION: Use FLASH for simple queries
         if is_simple and self.config.use_flash_for_simple:
@@ -1061,20 +1068,70 @@ Query: {state.query}
                 query=state.query,
                 evidence=evidence or "No specific findings accumulated",
                 citations=citations or "No citations collected",
+                pinned_content=pinned_content,
                 client=self.client,
             )
         else:
-            # Full synthesis with all three sources clearly separated
+            # Full synthesis with all four sources clearly separated
             response = await decisions.synthesize(
                 query=state.query,
                 evidence=evidence or "No specific findings accumulated",
                 citations=citations or "No citations collected",
                 external_research=f"=== CASE LAW (CourtListener) ===\n{case_law_text}\n\n=== REGULATIONS/STANDARDS (Web) ===\n{web_text}",
+                pinned_content=pinned_content,
                 client=self.client,
             )
 
         state.findings["final_output"] = response
-        self._emit_step(state, StepType.SYNTHESIS, "Analysis complete (3 sources: docs, case law, web)")
+        source_count = 4 if pinned_content else 3
+        self._emit_step(state, StepType.SYNTHESIS, f"Analysis complete ({source_count} sources: docs, case law, web{', decisive docs' if pinned_content else ''})")
+
+    async def _load_pinned_documents(self, state: InvestigationState) -> str:
+        """Load content from DECISIVE pinned documents for synthesis.
+
+        Respects a 100k character budget with max 30k per document.
+        Returns formatted content string or empty string if none.
+        """
+        pinned_docs = state.findings.get("pinned_documents", [])
+        if not pinned_docs:
+            return ""
+
+        TOTAL_BUDGET = 100_000  # 100k total budget
+        MAX_PER_DOC = 30_000   # Max 30k per document
+
+        pinned_content_parts = []
+        budget_remaining = TOTAL_BUDGET
+        docs_loaded = 0
+
+        for filepath in pinned_docs:
+            if budget_remaining <= 0:
+                logger.info(f"Pinned document budget exhausted, skipping remaining {len(pinned_docs) - docs_loaded} docs")
+                break
+
+            try:
+                doc = self.repo.read(filepath)
+                if doc:
+                    # Get excerpt respecting both per-doc and remaining budget limits
+                    max_chars = min(MAX_PER_DOC, budget_remaining)
+                    excerpt = doc.get_excerpt(max_chars)
+
+                    if excerpt:
+                        filename = doc.filename or filepath.split("/")[-1].split("\\")[-1]
+                        pinned_content_parts.append(f"\n=== DECISIVE: {filename} ===\n{excerpt}")
+                        budget_remaining -= len(excerpt)
+                        docs_loaded += 1
+                        logger.info(f"Loaded pinned document: {filename} ({len(excerpt)} chars)")
+            except Exception as e:
+                logger.warning(f"Failed to load pinned document {filepath}: {e}")
+
+        if pinned_content_parts:
+            self._emit_step(
+                state,
+                StepType.INFO,
+                f"Loaded {docs_loaded} decisive document(s) for synthesis"
+            )
+
+        return "".join(pinned_content_parts)
 
     def _emit_step(
         self,

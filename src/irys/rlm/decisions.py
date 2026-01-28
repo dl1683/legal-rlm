@@ -628,17 +628,20 @@ async def synthesize(
     citations: str,
     client: GeminiClient,
     external_research: str = "",
+    pinned_content: str = "",
 ) -> str:
     """Synthesize final answer. Uses PRO model."""
     start_time = time.time()
     evidence_lines = evidence.count('\n') + 1 if evidence else 0
-    logger.info(f"📝 synthesize: creating final answer from {evidence_lines} evidence lines")
+    pinned_info = f", {len(pinned_content)} chars pinned" if pinned_content else ""
+    logger.info(f"📝 synthesize: creating final answer from {evidence_lines} evidence lines{pinned_info}")
 
     prompt = prompts.P_SYNTHESIZE.format(
         query=query,
         evidence=evidence,
         external_research=external_research or "No external research conducted.",
         citations=citations,
+        pinned_content=pinned_content or "No decisive documents identified.",
     )
 
     _log_llm_call("synthesize", ModelTier.PRO, prompt, start_time)
@@ -654,16 +657,19 @@ async def synthesize_simple(
     evidence: str,
     citations: str,
     client: GeminiClient,
+    pinned_content: str = "",
 ) -> str:
     """Synthesize simple factual answer. Uses FLASH model for speed."""
     start_time = time.time()
     evidence_lines = evidence.count('\n') + 1 if evidence else 0
-    logger.info(f"📝 synthesize_simple: quick answer from {evidence_lines} evidence lines [FLASH]")
+    pinned_info = f", {len(pinned_content)} chars pinned" if pinned_content else ""
+    logger.info(f"📝 synthesize_simple: quick answer from {evidence_lines} evidence lines{pinned_info} [FLASH]")
 
     prompt = prompts.P_SYNTHESIZE_SIMPLE.format(
         query=query,
         evidence=evidence,
         citations=citations,
+        pinned_content=pinned_content or "",
     )
 
     _log_llm_call("synthesize_simple", ModelTier.FLASH, prompt, start_time)
