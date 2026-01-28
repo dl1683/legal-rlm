@@ -40,10 +40,24 @@ class RepositoryStats:
     total_size_bytes: int
     files_by_type: dict[str, int]
     folders: list[str]
+    skipped_legacy_files: int = 0  # Count of .doc/.rtf files that can't be processed
 
     @property
     def size_mb(self) -> float:
         return self.total_size_bytes / (1024 * 1024)
+
+    @property
+    def has_legacy_files(self) -> bool:
+        """True if there are legacy files that couldn't be processed."""
+        return self.skipped_legacy_files > 0
+
+
+@dataclass
+class RepositoryMetadata:
+    """Metadata about repository content size."""
+    total_files: int
+    total_chars: int
+    learnings: dict[str, str] = field(default_factory=dict)  # query -> key facts
 
 
 class MatterRepository:
@@ -52,12 +66,15 @@ class MatterRepository:
 
     Provides:
     - File listing and navigation
-    - Document reading (PDF, DOCX, TXT)
+    - Document reading (PDF, DOCX, TXT, MHT)
     - Grep-style search across all documents
     - Parallel operations
+
+    Note: Old .doc (binary) and .rtf formats are NOT supported.
+    Convert to .docx or .pdf before adding to repository.
     """
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
+    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".mht", ".mhtml"}
 
     def __init__(self, base_path: str | Path):
         self.base_path = Path(base_path)
@@ -71,7 +88,73 @@ class MatterRepository:
         self.search_engine = DocumentSearch(self.reader)
         self.search_engine._doc_cache = self._doc_cache  # Share cache
         self._file_cache: Optional[list[FileInfo]] = None
+        self._metadata: Optional["RepositoryMetadata"] = None
         logger.info(f"Initialized repository: {base_path}")
+
+    @property
+    def is_small_repo(self) -> bool:
+        """Check if repository is small enough for direct content loading."""
+        SMALL_REPO_THRESHOLD = 100_000  # 100K chars
+        if self._metadata is None:
+            self._compute_metadata()
+        return self._metadata.total_chars < SMALL_REPO_THRESHOLD
+
+    @property
+    def metadata(self) -> Optional["RepositoryMetadata"]:
+        """Get repository metadata (lazy computed)."""
+        if self._metadata is None:
+            self._compute_metadata()
+        return self._metadata
+
+    def _compute_metadata(self) -> None:
+        """Compute and cache repository metadata."""
+        files = self.list_files()
+        total_chars = 0
+        for f in files[:50]:  # Sample first 50 files to estimate
+            try:
+                doc = self.read(f.path)
+                total_chars += len(doc.full_text)
+            except Exception:
+                pass
+        # Extrapolate if we sampled
+        if len(files) > 50:
+            total_chars = int(total_chars * len(files) / 50)
+        self._metadata = RepositoryMetadata(
+            total_files=len(files),
+            total_chars=total_chars,
+        )
+
+    def add_learning(self, query: str, facts: str) -> None:
+        """Store learnings from a query for future reference."""
+        if self._metadata is None:
+            self._compute_metadata()
+        self._metadata.learnings[query] = facts
+
+    def get_learnings(self, limit: int = 5) -> list[dict[str, str]]:
+        """Get recent learnings from this repository."""
+        if self._metadata is None:
+            return []
+        learnings = []
+        for query, finding in list(self._metadata.learnings.items())[:limit]:
+            learnings.append({"query": query, "finding": finding})
+        return learnings
+
+    def get_all_content(self, max_chars: int = 500_000) -> str:
+        """Get all document content concatenated (for small repos)."""
+        files = self.list_files()
+        content_parts = []
+        total_chars = 0
+        for f in files:
+            if total_chars >= max_chars:
+                break
+            try:
+                doc = self.read(f.path)
+                text = doc.full_text
+                content_parts.append(f"\n\n=== {f.filename} ===\n{text}")
+                total_chars += len(text)
+            except Exception as e:
+                logger.warning(f"Failed to read {f.filename}: {e}")
+        return "".join(content_parts)
 
     # === NAVIGATION ===
 
@@ -123,24 +206,59 @@ class MatterRepository:
         return dict(sorted(structure.items()))
 
     def get_stats(self) -> RepositoryStats:
-        """Get repository statistics."""
-        files = self.list_files()
+        """Get repository statistics.
 
+        Also detects and counts legacy files (.doc, .rtf) that exist
+        but cannot be processed. Logs a single summary warning if any
+        legacy files are found.
+        """
         files_by_type: dict[str, int] = {}
         total_size = 0
         folders = set()
+        total_files = 0
 
-        for f in files:
-            files_by_type[f.file_type] = files_by_type.get(f.file_type, 0) + 1
-            total_size += f.size_bytes
-            folder = str(Path(f.relative_path).parent)
-            folders.add(folder)
+        # Legacy file tracking
+        legacy_extensions = {".doc", ".rtf"}
+        skipped_legacy = 0
+        legacy_samples: list[str] = []  # Track a few for the warning
+
+        # Single traversal: count supported and legacy files
+        for path in self.base_path.glob("**/*"):
+            if not path.is_file() or path.name.startswith("~$"):
+                continue
+
+            ext = path.suffix.lower()
+
+            if ext in self.SUPPORTED_EXTENSIONS:
+                total_files += 1
+                files_by_type[ext] = files_by_type.get(ext, 0) + 1
+                total_size += path.stat().st_size
+                rel_path = str(path.relative_to(self.base_path))
+                folder = str(Path(rel_path).parent)
+                if folder == ".":
+                    folder = "(root)"  # Normalize to match get_structure()
+                folders.add(folder)
+            elif ext in legacy_extensions:
+                skipped_legacy += 1
+                if len(legacy_samples) < 3:  # Collect up to 3 samples
+                    legacy_samples.append(str(path.relative_to(self.base_path)))
+
+        # Log a single summary warning if legacy files found
+        if skipped_legacy > 0:
+            samples_str = ", ".join(legacy_samples)
+            if skipped_legacy > 3:
+                samples_str += f", ... ({skipped_legacy - 3} more)"
+            logger.warning(
+                f"Repository contains {skipped_legacy} unsupported legacy file(s) "
+                f"(.doc/.rtf): {samples_str}. Convert to .docx or .pdf for processing."
+            )
 
         return RepositoryStats(
-            total_files=len(files),
+            total_files=total_files,
             total_size_bytes=total_size,
             files_by_type=files_by_type,
             folders=sorted(folders),
+            skipped_legacy_files=skipped_legacy,
         )
 
     # === READING ===
@@ -267,6 +385,36 @@ class MatterRepository:
             case_sensitive=case_sensitive,
             context_lines=context_lines,
             max_workers=max_workers,
+        )
+
+    def smart_search(
+        self,
+        query: str,
+        folder: Optional[str] = None,
+        file_types: Optional[list[str]] = None,
+        regex: bool = False,
+        case_sensitive: bool = False,
+        context_lines: int = 2,
+    ) -> SearchResults:
+        """
+        Smart search with OR fallback for multi-word queries.
+
+        If exact phrase returns no results, automatically splits into
+        individual terms and searches for each, deduplicating results.
+        """
+        if folder:
+            pattern = f"{folder}/**/*"
+        else:
+            pattern = "**/*"
+
+        files = [f.path for f in self.list_files(pattern, file_types)]
+
+        return self.search_engine.smart_search(
+            query=query,
+            files=files,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            context_lines=context_lines,
         )
 
     def search_multi(

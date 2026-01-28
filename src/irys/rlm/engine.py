@@ -1,23 +1,25 @@
 """RLM Engine - Recursive Language Model investigation engine.
 
-This is the core of the system. It implements:
-1. Iterative refinement with data-driven replanning
-2. Recursive investigation of leads
-3. Parallel document processing
-4. Tiered model usage (Lite -> Flash -> Pro)
+OPTIMIZED VERSION:
+- Document extraction cache (don't re-extract same doc)
+- Search term deduplication (skip similar searches)
+- Smart model selection (FLASH for simple queries)
+- Early sufficiency checks (after first iteration)
 """
 
-from dataclasses import dataclass
-from typing import Optional, Callable, Any, AsyncIterator
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Any
 from pathlib import Path
 import asyncio
-import json
 import logging
+import re
 
 from ..core.models import GeminiClient, ModelTier
 from ..core.repository import MatterRepository
 from ..core.search import SearchResults
+from ..core.external_search import ExternalSearchManager
 from .state import InvestigationState, StepType, ThinkingStep, Citation, Lead, classify_query
+from . import decisions
 
 logger = logging.getLogger(__name__)
 
@@ -25,541 +27,70 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RLMConfig:
     """Configuration for RLM engine."""
-    max_depth: int = 5
-    max_leads_per_level: int = 5
-    max_documents_per_search: int = 10
-    min_lead_priority: float = 0.3
-    excerpt_chars: int = 8000
-    parallel_reads: int = 5
-    checkpoint_dir: Optional[str] = None  # Directory for checkpoints
-    checkpoint_interval: int = 5  # Save checkpoint every N iterations
-    adaptive_depth: bool = True  # Adjust depth based on complexity
-    min_depth: int = 2  # Minimum depth even for simple queries
-    depth_citation_threshold: int = 15  # Stop early if enough citations
-    max_iterations: int = 20  # Maximum investigation loop iterations
-
-
-# System prompts for different stages
-ORIENTATION_PROMPT = """You are an expert legal analyst conducting due diligence on a document repository.
-
-Repository Structure:
-{structure}
-
-Total files: {total_files}
-
-User Query: {query}
-
-Your task is to create a strategic research plan. Think like an experienced litigator or investigator.
-
-Consider:
-1. What are the CORE legal issues that need to be established?
-2. Which document types are MOST LIKELY to contain direct evidence? (e.g., contracts for terms, emails for intent, financials for damages)
-3. What SPECIFIC search terms will find relevant passages? Include legal terms, party names, key dates, and transaction-specific language.
-4. What is your preliminary hypothesis based on the query structure?
-
-PRIORITIZE:
-- Primary source documents (contracts, pleadings) over secondary (correspondence)
-- Documents with dates matching key events
-- Files mentioning specific parties or amounts
-
-Respond in JSON format:
-{{
-    "issues": ["issue1", "issue2", ...],
-    "relevant_folders": ["folder1", "folder2", ...],
-    "initial_searches": ["term1", "term2", ...],
-    "search_rationale": "Why these search terms will find relevant evidence",
-    "document_priority": ["most important doc type", "second most important", ...],
-    "hypothesis": "Your initial hypothesis based on query analysis"
-}}
-"""
-
-ANALYZE_FINDINGS_PROMPT = """You are a senior legal analyst extracting evidence from search results.
-
-Query: {query}
-Current Hypothesis: {hypothesis}
-
-Search Results for "{search_term}":
-{search_results}
-
-ANALYZE THESE RESULTS CAREFULLY:
-
-1. KEY FACTS: Extract ONLY the 10 most important specific facts (STRICT LIMIT: 10 maximum):
-   - Directly relevant to the query
-   - Supported by the document text
-   - Include dates, amounts, party names where found
-   - Keep each fact under 100 characters
-
-2. NEW LEADS: Identify specific avenues to investigate:
-   - Referenced documents that should be examined
-   - Named individuals who should be researched
-   - Dates/events mentioned that need context
-   - Cross-references to other documents
-   - Potential contradictions to verify
-
-3. HYPOTHESIS EVALUATION:
-   - Does this evidence SUPPORT or CONTRADICT our hypothesis?
-   - What gaps remain in our understanding?
-
-4. NEXT SEARCHES: Suggest terms that will:
-   - Corroborate findings from multiple sources
-   - Fill gaps in the evidence
-   - Find contradictory evidence (for completeness)
-
-Respond in COMPACT JSON (keep under 3000 chars):
-{{
-    "key_facts": ["fact 1", "fact 2", ...],
-    "new_leads": [{{"desc": "...", "priority": 0.8}}],
-    "hypothesis_update": "string or null",
-    "next_searches": ["term1", "term2"]
-}}
-"""
-
-DEEP_READ_PROMPT = """You are an expert legal analyst performing detailed document review.
-
-Document: {filename}
-Page Range: {page_range}
-
-Content:
-{content}
-
-Query Context: {query}
-Current Investigation Focus: {focus}
-
-CONDUCT A FOCUSED LEGAL ANALYSIS. IMPORTANT: Keep response under 4000 characters total.
-
-1. KEY FACTS (STRICT LIMIT: 15 maximum facts): Extract facts that are:
-   - Directly relevant to the query/focus
-   - Specific (include dates, amounts, names)
-   - Keep each fact under 100 characters
-
-2. CRITICAL QUOTES (STRICT LIMIT: 3 maximum): Identify the most important passages:
-   - Direct admissions or acknowledgments
-   - Terms that define obligations or rights
-   - Statements of fact that support/contradict claims
-   - Language that creates legal obligations
-
-3. ENTITIES: Extract with role/context:
-   - People: name, role, significance
-   - Companies: name, relationship to parties
-   - Dates: date, what happened, significance
-   - Amounts: value, context, what it represents
-
-4. DOCUMENT RELATIONSHIPS:
-   - References to other documents (attachments, exhibits)
-   - Prior agreements or communications mentioned
-   - Events that require corroboration elsewhere
-
-5. RED FLAGS & CONCERNS:
-   - Ambiguous or potentially misleading language
-   - Missing expected provisions
-   - Contradictions within the document
-   - Issues requiring legal interpretation
-
-Respond in COMPACT JSON (STRICT: under 4000 chars total):
-{{
-    "key_facts": [{{"fact": "...", "page": N}}],
-    "quotes": [{{"text": "...", "page": N}}],
-    "entities": {{"people": ["name1"], "dates": ["date1"], "amounts": ["$X"]}},
-    "connections": ["doc reference 1"],
-    "concerns": ["issue 1"]
-}}
-"""
-
-SYNTHESIS_PROMPT = """You are a senior partner at a law firm drafting a legal memorandum.
-
-Original Query: {query}
-
-Investigation Summary:
-- Documents analyzed: {docs_analyzed}
-- Searches performed: {searches}
-- Citations collected: {citation_count}
-- Maximum investigation depth: {max_depth}
-
-Working Hypothesis: {hypothesis}
-
-Key Entities Identified:
-{entities}
-
-Evidence Gathered:
-{findings}
-
-Documentary Citations:
-{citations}
-
-PREPARE A COMPREHENSIVE LEGAL MEMORANDUM:
-
-## Executive Summary
-Provide a 2-3 sentence direct answer to the query. Lead with the conclusion.
-
-## Factual Background
-Chronological narrative of relevant events established by the evidence.
-Cite sources: [Document Name, p. X]
-
-## Analysis
-
-### Key Findings
-- Finding 1 with citation [Source]
-- Finding 2 with citation [Source]
-(Prioritize VERIFIED citations)
-
-### Supporting Evidence
-Detail the strongest evidence supporting conclusions.
-
-### Contradictions or Concerns
-Note any conflicting evidence or unresolved issues.
-
-### Evidence Strength Assessment
-Rate overall evidence as: Strong / Moderate / Weak
-Explain basis for rating.
-
-## Entities & Relationships
-Key parties and their roles established by evidence.
-
-## Gaps & Limitations
-- What evidence was NOT found
-- Areas needing further investigation
-- Limitations of available documents
-
-## Recommendations
-1. Immediate actions based on findings
-2. Additional investigation needed
-3. Risk mitigation steps
-
----
-Write in formal legal memorandum style. Be precise and cite everything.
-Mark unverified citations with [UNVERIFIED].
-Do not speculate beyond what evidence supports.
-"""
-
-SUMMARIZE_DOCUMENT_PROMPT = """You are a legal analyst creating a comprehensive document summary for litigation support.
-
-Document: {filename}
-Detected Type: {doc_type}
-
-Content:
-{content}
-
-CREATE A LITIGATION-READY SUMMARY:
-
-1. DOCUMENT CLASSIFICATION:
-   - Type: contract, pleading, correspondence, discovery, financial, corporate, other
-   - Purpose: What is this document meant to accomplish?
-   - Significance: Why would this matter in litigation?
-
-2. PARTIES & SIGNATORIES:
-   - All named parties and their roles
-   - Who signed/authored this document?
-   - Third parties mentioned
-
-3. KEY DATES:
-   - Document date
-   - Effective dates
-   - Deadlines mentioned
-   - Events referenced
-
-4. SUBSTANTIVE CONTENT:
-   For Contracts: key terms, obligations, conditions, termination clauses
-   For Pleadings: claims, defenses, relief sought
-   For Correspondence: subject matter, requests made, commitments
-   For Financial: amounts, accounts, transactions
-
-5. MONETARY AMOUNTS:
-   - All dollar figures with context
-   - Payment terms
-   - Damages claimed
-
-6. RED FLAGS:
-   - Ambiguous provisions
-   - Unusual terms
-   - Potential liability issues
-   - Missing expected content
-
-Respond in JSON format:
-{{
-    "summary": "2-3 sentence executive summary",
-    "document_type": "contract/pleading/correspondence/discovery/financial/corporate/other",
-    "document_date": "YYYY-MM-DD or null",
-    "parties": [{{"name": "...", "role": "..."}}],
-    "signatories": ["name1", "name2"],
-    "key_dates": [{{"date": "...", "event": "...", "significance": "..."}}],
-    "key_terms": [{{"term": "...", "page": N, "significance": "..."}}],
-    "amounts": [{{"value": "...", "context": "...", "page": N}}],
-    "concerns": [{{"issue": "...", "severity": "high/medium/low"}}],
-    "cross_references": ["documents mentioned or referenced"]
-}}
-"""
-
-SUMMARIZE_COLLECTION_PROMPT = """You are a senior litigation analyst creating a matter overview from a document collection.
-
-Documents Being Summarized:
-{document_list}
-
-Individual Summaries:
-{summaries}
-
-CREATE A COMPREHENSIVE MATTER ANALYSIS:
-
-1. MATTER OVERVIEW:
-   - What is this case/transaction about?
-   - Key dispute or purpose
-   - Current status/stage
-
-2. PARTY ANALYSIS:
-   - All parties and their roles
-   - Relationships between parties
-   - Key individuals and their significance
-
-3. CHRONOLOGY:
-   - Construct a timeline of events
-   - Identify cause-and-effect relationships
-   - Note date gaps or inconsistencies
-
-4. DOCUMENT ECOSYSTEM:
-   - How do these documents relate to each other?
-   - Which documents reference others?
-   - What is the chain of custody/communication?
-
-5. KEY THEMES:
-   - Major legal issues present
-   - Recurring topics across documents
-   - Points of agreement and dispute
-
-6. EVIDENTIARY ASSESSMENT:
-   - What is well-documented vs. poorly documented?
-   - Strength of documentary evidence
-   - Critical missing documents
-
-7. STRATEGIC OBSERVATIONS:
-   - Potential strengths
-   - Potential weaknesses
-   - Areas requiring immediate attention
-
-Respond in JSON format:
-{{
-    "collection_summary": "3-5 sentence executive overview",
-    "matter_type": "contract dispute/tort/corporate/regulatory/other",
-    "parties": [{{"name": "...", "role": "...", "key_documents": ["doc1"]}}],
-    "timeline": [{{"date": "...", "event": "...", "source": "...", "significance": "..."}}],
-    "themes": [{{"theme": "...", "relevant_docs": ["doc1", "doc2"], "assessment": "..."}}],
-    "document_relationships": [{{"from": "doc1", "to": "doc2", "relationship": "references/amends/responds_to/contradicts"}}],
-    "evidence_strength": {{
-        "well_documented": ["topic1", "topic2"],
-        "poorly_documented": ["topic3"],
-        "missing": ["expected document type"]
-    }},
-    "strategic_notes": ["observation1", "observation2"]
-}}
-"""
-
-# Additional specialized prompts for enhanced analysis
-
-ENTITY_EXTRACTION_PROMPT = """You are a legal analyst extracting entities from document text.
-
-Document: {filename}
-Text Excerpt:
-{text}
-
-Extract ALL entities with their context and significance:
-
-1. PEOPLE:
-   - Names (formal and informal references)
-   - Titles/Roles
-   - Affiliations
-   - Actions attributed to them
-
-2. ORGANIZATIONS:
-   - Company names (including d/b/a and subsidiaries)
-   - Government agencies
-   - Law firms
-   - Other entities
-
-3. DATES & TIMEFRAMES:
-   - Specific dates
-   - Date ranges
-   - Relative timeframes ("30 days after...")
-
-4. MONETARY VALUES:
-   - Dollar amounts
-   - Percentages
-   - Financial metrics
-
-5. LOCATIONS:
-   - Addresses
-   - Jurisdictions
-   - Venues
-
-6. LEGAL TERMS:
-   - Case citations
-   - Statute references
-   - Defined terms from agreements
-
-Respond in JSON format:
-{{
-    "people": [{{"name": "...", "role": "...", "context": "...", "mentions": N}}],
-    "organizations": [{{"name": "...", "type": "...", "relationship": "..."}}],
-    "dates": [{{"date": "...", "context": "...", "type": "specific/deadline/effective"}}],
-    "amounts": [{{"value": "...", "context": "...", "type": "payment/damages/fee"}}],
-    "locations": [{{"place": "...", "type": "address/jurisdiction/venue"}}],
-    "legal_refs": [{{"citation": "...", "type": "case/statute/contract_term"}}]
-}}
-"""
-
-CONTRADICTION_DETECTION_PROMPT = """You are a legal analyst identifying contradictions and inconsistencies.
-
-Document 1: {doc1_name}
-Statement: "{statement1}"
-Context: {context1}
-
-Document 2: {doc2_name}
-Statement: "{statement2}"
-Context: {context2}
-
-ANALYZE FOR CONTRADICTIONS:
-
-1. Are these statements contradictory? Consider:
-   - Direct factual contradictions
-   - Inconsistent timelines
-   - Conflicting obligations
-   - Different characterizations of same event
-
-2. Severity Assessment:
-   - HIGH: Material contradiction affecting core claims
-   - MEDIUM: Significant inconsistency requiring explanation
-   - LOW: Minor discrepancy, possibly reconcilable
-
-3. Possible Explanations:
-   - Could both statements be true in context?
-   - Is this a drafting error vs. substantive conflict?
-   - Does timing explain the difference?
-
-Respond in JSON format:
-{{
-    "is_contradiction": true/false,
-    "contradiction_type": "factual/temporal/characterization/obligation/none",
-    "severity": "high/medium/low/none",
-    "explanation": "Why these contradict or don't",
-    "reconciliation_possible": true/false,
-    "reconciliation_theory": "How these could both be true (if applicable)",
-    "legal_significance": "Why this matters for the matter",
-    "follow_up_needed": ["additional verification steps"]
-}}
-"""
-
-TIMELINE_EXTRACTION_PROMPT = """You are a legal analyst constructing a chronology from documents.
-
-Documents Analyzed:
-{document_list}
-
-Events Found:
-{events}
-
-CONSTRUCT A LEGAL CHRONOLOGY:
-
-1. Order events by date (earliest to latest)
-2. Identify causal relationships between events
-3. Note gaps in the timeline
-4. Flag conflicting dates for the same event
-5. Highlight deadline-critical events
-
-For each event, assess:
-- Certainty of date (exact vs. approximate)
-- Source reliability
-- Legal significance
-- Relationship to other events
-
-Respond in JSON format:
-{{
-    "chronology": [
-        {{
-            "date": "YYYY-MM-DD",
-            "date_certainty": "exact/approximate/inferred",
-            "event": "description",
-            "source_doc": "filename",
-            "source_page": N,
-            "legal_significance": "why this matters",
-            "related_events": ["event_ids that connect"],
-            "is_deadline": true/false
-        }}
-    ],
-    "timeline_gaps": [
-        {{"period": "from - to", "what_might_be_missing": "..."}}
-    ],
-    "date_conflicts": [
-        {{"event": "...", "date1": "...", "source1": "...", "date2": "...", "source2": "..."}}
-    ],
-    "key_periods": [
-        {{"period": "from - to", "description": "what happened", "significance": "..."}}
-    ]
-}}
-"""
-
-EVIDENCE_ASSESSMENT_PROMPT = """You are a senior litigator assessing the strength of evidence.
-
-Claim Being Assessed: {claim}
-
-Supporting Evidence:
-{supporting_evidence}
-
-Contradicting Evidence:
-{contradicting_evidence}
-
-ASSESS EVIDENCE STRENGTH:
-
-1. DIRECT vs. CIRCUMSTANTIAL
-   - What evidence directly proves the claim?
-   - What is circumstantial?
-
-2. PRIMARY vs. SECONDARY SOURCES
-   - Contracts, signed documents = primary
-   - Emails, notes = secondary
-   - Testimony, recollections = tertiary
-
-3. CORROBORATION
-   - Is evidence corroborated by multiple sources?
-   - Any single-source critical facts?
-
-4. AUTHENTICATION POTENTIAL
-   - Can this evidence be authenticated?
-   - Who would authenticate it?
-
-5. HEARSAY ISSUES
-   - What statements are hearsay?
-   - Any exceptions applicable?
-
-6. OVERALL ASSESSMENT
-   - Rate claim as: Strongly Supported / Moderately Supported / Weakly Supported / Contradicted
-
-Respond in JSON format:
-{{
-    "claim": "{claim}",
-    "evidence_classification": {{
-        "direct": ["evidence1", "evidence2"],
-        "circumstantial": ["evidence3"],
-        "primary_sources": ["doc1"],
-        "secondary_sources": ["doc2"],
-        "hearsay_concerns": ["statement1"]
-    }},
-    "corroboration_level": "high/medium/low/none",
-    "authentication_assessment": "easily authenticated/challengeable/problematic",
-    "overall_strength": "strong/moderate/weak/contradicted",
-    "strength_score": 0-100,
-    "reasoning": "detailed explanation",
-    "vulnerabilities": ["weakness1", "weakness2"],
-    "strengthening_opportunities": ["what additional evidence would help"]
-}}
-"""
+    max_depth: int = 3  # Reduced from 5
+    max_leads_per_level: int = 3  # Reduced from 5
+    max_documents_per_search: int = 5  # Reduced from 10
+    # Dynamic excerpt limits based on query complexity
+    excerpt_chars_simple: int = 8000  # Fast path for simple queries
+    excerpt_chars_complex: int = 40000  # Full coverage for complex queries
+    parallel_reads: int = 3  # Reduced from 5
+    checkpoint_dir: Optional[str] = None
+    checkpoint_interval: int = 5
+    max_iterations: int = 10  # Reduced from 20
+    # New optimization settings
+    early_exit_facts: int = 5  # Exit early if we have this many facts
+    skip_similar_searches: bool = True
+    use_flash_for_simple: bool = True
+    # External search settings
+    enable_external_search: bool = True
+    max_case_law_results: int = 5
+    max_web_results: int = 5
+
+
+@dataclass
+class InvestigationCache:
+    """Cache to avoid redundant work."""
+    extracted_docs: set = field(
+        default_factory=set)  # Docs we've extracted facts from
+    searched_terms: set = field(default_factory=set)  # Search terms we've used
+
+    def has_extracted(self, filepath: str) -> bool:
+        """Check if we've already extracted facts from this doc."""
+        return filepath in self.extracted_docs
+
+    def mark_extracted(self, filepath: str):
+        """Mark a doc as extracted."""
+        self.extracted_docs.add(filepath)
+
+    def is_similar_search(self, term: str) -> bool:
+        """Check if we've done a similar search."""
+        term_lower = term.lower()
+        term_words = set(term_lower.split())
+
+        for existing in self.searched_terms:
+            existing_words = set(existing.lower().split())
+            # If >50% word overlap, consider it similar
+            if term_words and existing_words:
+                overlap = len(term_words & existing_words) / \
+                    min(len(term_words), len(existing_words))
+                if overlap > 0.5:
+                    return True
+        return False
+
+    def add_search(self, term: str):
+        """Record a search term."""
+        self.searched_terms.add(term.lower())
 
 
 class RLMEngine:
     """
     Recursive Language Model investigation engine.
 
-    Implements the adaptive research loop:
-    1. Orient - understand repository and form hypothesis
-    2. Search - find relevant documents
-    3. Analyze - extract findings and leads
-    4. Recurse - investigate leads depth-first
-    5. Synthesize - produce final output
+    OPTIMIZED loop:
+    1. Plan - create investigation strategy
+    2. Execute - search and read documents (with caching)
+    3. Check - LLM decides if sufficient (check early!)
+    4. Synthesize - use appropriate model based on query type
     """
 
     def __init__(
@@ -575,60 +106,48 @@ class RLMEngine:
         self.on_step = on_step
         self.on_citation = on_citation
         self.on_progress = on_progress
-        # Global semaphore to limit concurrent CPU-intensive operations
-        self._operation_semaphore: Optional[asyncio.Semaphore] = None
-        self._doc_count: int = 0  # Track document count for adaptive behavior
+        # Initialize external search manager (enabled by default)
+        self.external_search = ExternalSearchManager(
+        ) if self.config.enable_external_search else None
+        self._external_research: dict = {}  # Store external research results
 
-    def _get_semaphore(self) -> asyncio.Semaphore:
-        """Get or create the operation semaphore."""
-        if self._operation_semaphore is None:
-            # Limit concurrent operations based on document count
-            # Small repos (<=5 docs): max 2 concurrent ops
-            # Medium repos (6-20 docs): max 3 concurrent ops
-            # Large repos (>20 docs): max 5 concurrent ops
-            if self._doc_count <= 5:
-                max_concurrent = 2
-            elif self._doc_count <= 20:
-                max_concurrent = 3
-            else:
-                max_concurrent = 5
-            self._operation_semaphore = asyncio.Semaphore(max_concurrent)
-        return self._operation_semaphore
+    def _adapt_config_for_repo_size(self, total_files: int) -> None:
+        """Adapt configuration based on repository size.
 
-    def _adapt_config_for_repo_size(self, doc_count: int):
-        """Adjust config parameters based on repository size."""
-        self._doc_count = doc_count
-
-        if doc_count <= 5:
-            # Small repos: reduce parallelism significantly
-            self.config.max_leads_per_level = min(self.config.max_leads_per_level, 2)
-            self.config.parallel_reads = min(self.config.parallel_reads, 2)
-            self.config.max_iterations = min(self.config.max_iterations, 8)
-            self.config.depth_citation_threshold = min(self.config.depth_citation_threshold, 8)
-        elif doc_count <= 20:
-            # Medium repos: moderate reduction
-            self.config.max_leads_per_level = min(self.config.max_leads_per_level, 3)
-            self.config.parallel_reads = min(self.config.parallel_reads, 3)
-            self.config.max_iterations = min(self.config.max_iterations, 12)
-        # Large repos: use default config
+        Small repos can use more aggressive settings.
+        Large repos need conservative settings to avoid timeouts.
+        """
+        if total_files <= 10:
+            # Very small repo - can be aggressive
+            self.config.max_leads_per_level = 5
+            self.config.parallel_reads = 5
+            self.config.max_documents_per_search = 10
+        elif total_files <= 50:
+            # Medium repo - balanced settings
+            self.config.max_leads_per_level = 4
+            self.config.parallel_reads = 4
+            self.config.max_documents_per_search = 7
+        elif total_files <= 200:
+            # Large repo - conservative
+            self.config.max_leads_per_level = 3
+            self.config.parallel_reads = 3
+            self.config.max_documents_per_search = 5
+        else:
+            # Very large repo - very conservative
+            self.config.max_leads_per_level = 2
+            self.config.parallel_reads = 2
+            self.config.max_documents_per_search = 3
+            self.config.max_depth = 2
 
     async def investigate(
         self,
         query: str,
         repository_path: str | Path,
     ) -> InvestigationState:
-        """
-        Run full recursive investigation.
-
-        Args:
-            query: The legal question to investigate
-            repository_path: Path to document repository
-
-        Returns:
-            InvestigationState with all findings, citations, thinking trace
-        """
+        """Run full recursive investigation."""
         repo = MatterRepository(repository_path)
         state = InvestigationState.create(query, str(repository_path))
+        cache = InvestigationCache()
 
         # Adapt configuration based on repository size
         stats = repo.get_stats()
@@ -639,771 +158,1012 @@ class RLMEngine:
 
         # Classify the query
         state.query_classification = classify_query(query)
+        is_simple = state.query_classification['type'] == 'factual' and state.query_classification['complexity'] <= 2
+        self._is_simple_query = is_simple  # Store for dynamic limits
+
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Query classified as {state.query_classification['type']} (complexity: {state.query_classification['complexity']}/5)",
+            f"Query classified as {state.query_classification['type']} (complexity: {state.query_classification['complexity']}/5)" +
+            (" [SIMPLE - will use fast path]" if is_simple else ""),
         )
 
         try:
-            # Phase 1: Orientation
-            await self._orient(state, repo)
+            # Check if small repository - can skip complex RLM search
+            if repo.is_small_repo:
+                total_chars = repo.metadata.total_chars if repo.metadata else 0
+                self._emit_step(
+                    state,
+                    StepType.THINKING,
+                    f"Small repository detected ({total_chars:,} chars) - loading all content directly",
+                )
+                await self._direct_answer(state, repo)
+            else:
+                # Full RLM investigation for large repositories
+                # Mimics how a lawyer works:
 
-            # Phase 2: Iterative investigation loop
-            await self._investigate_loop(state, repo)
+                # Phase 1: Create investigation plan based on the query and repo structure
+                # The plan may or may not include external searches depending on the query
+                await self._create_plan(state, repo)
 
-            # Phase 2.5: Verify citations
-            await self._verify_citations(state, repo)
+                # Phase 1.5: Execute external searches IF the plan calls for them
+                # (Not mandatory - only if the LLM determined they're needed upfront)
+                if self.config.enable_external_search and self.external_search:
+                    await self._execute_external_searches(state)
 
-            # Phase 3: Final synthesis
-            await self._synthesize(state)
+                # Phase 2: Investigation loop with continuous recalibration
+                # - Reads documents, extracts facts
+                # - Continuously checks: sufficient? need to replan? need external research?
+                # - Dynamically triggers external search if findings reveal the need
+                await self._investigate_loop(state, repo, cache)
+
+                # Phase 3: Final synthesis
+                await self._synthesize(state, is_simple)
+
+                # Save learnings from this query for future reference
+                if repo.metadata and state.findings.get("accumulated_facts"):
+                    key_facts = state.findings["accumulated_facts"][:3]
+                    if key_facts:
+                        repo.add_learning(query, "; ".join(key_facts))
 
             state.complete()
 
         except Exception as e:
             state.fail(str(e))
             raise
+        finally:
+            # Clean up external search sessions
+            if self.external_search:
+                try:
+                    await self.external_search.close()
+                except Exception:
+                    pass
 
         return state
 
-    async def _orient(self, state: InvestigationState, repo: MatterRepository):
-        """Phase 1: Understand repository and form initial hypothesis."""
-        self._emit_step(state, StepType.THINKING, "Analyzing repository structure...")
+    async def _direct_answer(self, state: InvestigationState, repo: MatterRepository):
+        """
+        Direct answer mode for small repositories.
 
-        # Get repository overview
-        stats = repo.get_stats()
-        structure = repo.get_structure()
+        Skips: Complex RLM loop (leads, iterations, replanning, context management)
+        Keeps: External search tools (case law, web) when query needs them
 
-        structure_str = "\n".join(f"  {folder}: {count} files" for folder, count in structure.items())
+        Flow:
+        1. Load all documents directly (no search needed - small enough)
+        2. Create plan to determine if external research is needed
+        3. Execute external searches if needed
+        4. Synthesize answer from all sources
+        """
+        self._emit_step(state, StepType.READING, "Loading all documents...")
 
-        prompt = ORIENTATION_PROMPT.format(
-            structure=structure_str,
-            total_files=stats.total_files,
-            query=state.query,
+        # Load all content directly - no complex search needed for small repos
+        all_content = repo.get_all_content()
+        state.documents_read = len(repo.list_files())
+
+        self._emit_step(
+            state,
+            StepType.FINDING,
+            f"Loaded {len(all_content):,} chars from {state.documents_read} documents",
         )
 
-        # Use FLASH for intelligent planning
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
+        # For small repos, do a quick trigger extraction before deciding on external search
+        if self.config.enable_external_search and self.external_search:
+            self._emit_step(state, StepType.THINKING,
+                            "Scanning content for research triggers...")
 
-        plan = self._parse_json_safe(response, {
-            "issues": [],
-            "relevant_folders": [],
-            "initial_searches": [],
-            "hypothesis": "Investigating query across available documents",
-        })
+            # Quick LITE call to extract triggers from loaded content
+            triggers_result = await decisions.extract_triggers_from_content(
+                content=all_content,
+                client=self.client,
+            )
 
-        state.hypothesis = plan.get("hypothesis")
-        state.findings["issues"] = plan.get("issues", [])
-        state.findings["initial_plan"] = plan
+            # Accumulate triggers into state
+            state.add_triggers(triggers_result)
 
-        # Create initial leads from plan
-        for search_term in plan.get("initial_searches", [])[:5]:
-            if isinstance(search_term, str):
-                state.add_lead(
-                    description=f"Search for: {search_term}",
-                    source="initial_plan",
-                    priority=0.8,
+            # Check if meaningful triggers were found
+            if state.has_external_triggers(min_triggers=2):
+                triggers_summary = state.get_trigger_summary()
+                self._emit_step(
+                    state,
+                    StepType.THINKING,
+                    f"Research triggers found: {triggers_summary[:100]}...",
                 )
 
-        # If no searches were found, fall back to query-based search
-        if not plan.get("initial_searches"):
-            state.add_lead(
-                description=f"Search for key terms in query",
-                source="fallback",
-                priority=0.8,
+                # Extract entity names from content for context
+                content_sample = all_content[:5000]
+                potential_entities = re.findall(
+                    r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', content_sample)
+                quick_entities = list(set(potential_entities))[:10]
+
+                # Generate specific queries using triggers
+                result = await decisions.generate_external_queries(
+                    query=state.query,
+                    facts=[],
+                    entities=quick_entities,
+                    client=self.client,
+                    triggers=triggers_summary,
+                )
+
+                case_law_queries = result.get("case_law_queries", [])
+                web_queries = result.get("web_queries", [])
+
+                if case_law_queries or web_queries:
+                    state.findings["initial_plan"] = {
+                        "case_law_searches": case_law_queries,
+                        "web_searches": web_queries,
+                    }
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
+                    )
+                    await self._execute_external_searches(state)
+
+        # Compile external research if any and add citations
+        external_text = ""
+        if self._external_research:
+            formatted = self._format_external_research()
+            if formatted.get("case_law"):
+                external_text += f"\n\n=== CASE LAW ===\n{formatted['case_law']}"
+
+                # Add citations for case law
+                for case in self._external_research.get("case_law", [])[:5]:
+                    citation = state.add_citation(
+                        document=f"[Case Law] {case.get('case_name', 'Unknown Case')}",
+                        page=None,
+                        text=case.get('snippet', '') or '',
+                        context=f"Citation: {case.get('citation', 'N/A')} | Court: {case.get('court', 'N/A')}",
+                        relevance="External case law research",
+                    )
+                    if citation and self.on_citation:
+                        self.on_citation(citation)
+
+            if formatted.get("web"):
+                external_text += f"\n\n=== REGULATIONS/STANDARDS ===\n{formatted['web']}"
+
+                # Add citations for web results
+                for result in self._external_research.get("web", [])[:5]:
+                    citation = state.add_citation(
+                        document=f"[Web] {result.get('title', 'Unknown Source')}",
+                        page=None,
+                        text=result.get('content', '') or '',
+                        context=f"URL: {result.get('url', 'N/A')}",
+                        relevance="External regulatory research",
+                    )
+                    if citation and self.on_citation:
+                        self.on_citation(citation)
+
+        # Include any prior learnings from this repo
+        learnings = repo.get_learnings(5)
+        learnings_context = ""
+        if learnings:
+            learnings_context = "\n\nPrior learnings from this repository:\n" + "\n".join(
+                f"- Q: {l['query'][:50]}... -> {l['finding'][:100]}..." for l in learnings
             )
+
+        # Synthesize answer from all sources
+        self._emit_step(state, StepType.SYNTHESIS, "Analyzing all sources...")
+
+        # Adjust instructions based on whether query explicitly asks for external research
+        query_lower = state.query.lower()
+        asks_for_external = any(term in query_lower for term in [
+            'case law', 'precedent', 'regulation', 'regulatory', 'guidance', 'legal standard'
+        ])
+
+        if asks_for_external and external_text:
+            instructions = """INSTRUCTIONS:
+1. The query asks for EXTERNAL LEGAL RESEARCH - prioritize the CASE LAW and REGULATIONS sections
+2. Cite specific cases with their citations (e.g., "Horror Inc. v. Miller, 335 F. Supp. 3d 273")
+3. Reference specific regulations and their requirements
+4. Connect external research to the case documents where relevant
+5. If case law or regulations are limited, acknowledge that"""
+        else:
+            instructions = """INSTRUCTIONS:
+1. Answer based primarily on the CASE DOCUMENTS
+2. Support with case law and regulations if provided
+3. Cite specific sources for each fact
+4. Be precise with names, dates, amounts, and legal terms"""
+
+        response = await self.client.complete(
+            f"""You are a senior legal analyst. Answer this query using all provided sources.
+
+Query: {state.query}
+
+=== CASE DOCUMENTS ===
+{all_content}
+{external_text}
+{learnings_context}
+
+{instructions}""",
+            tier=ModelTier.FLASH,
+        )
+
+        state.findings["final_output"] = response
+        state.findings["mode"] = "direct_answer"
+        self._emit_step(state, StepType.SYNTHESIS, "Analysis complete")
+
+    def _format_external_research(self) -> dict[str, str]:
+        """Format external research results for synthesis prompts.
+
+        Returns:
+            Dict with 'case_law' and 'web' keys containing formatted text
+        """
+        result = {"case_law": "", "web": ""}
+
+        if not self._external_research:
+            return result
+
+        # Format case law results
+        case_law = self._external_research.get("case_law", [])
+        if case_law:
+            case_lines = []
+            for c in case_law[:5]:
+                snippet = c.get('snippet') or c.get(
+                    'opinion_text') or 'No snippet available'
+                case_lines.append(
+                    f"- **{c.get('case_name', 'Unknown')}** ({c.get('citation') or 'No citation'})\n"
+                    f"  Court: {c.get('court', 'Unknown')} | Date: {c.get('date_filed', 'Unknown')}\n"
+                    f"  Snippet: {snippet[:300]}..."
+                )
+            result["case_law"] = "\n\n".join(case_lines)
+
+            # Include analysis if available
+            analysis = self._external_research.get(
+                "analysis", {}).get("case_law", {})
+            if analysis:
+                summary = analysis.get("summary", "")
+                if summary:
+                    result["case_law"] += f"\n\n**Legal Standards Identified:** {summary}"
+
+        # Format web results
+        web = self._external_research.get("web", [])
+        if web:
+            web_lines = []
+            for r in web[:5]:
+                web_lines.append(
+                    f"- **{r.get('title', 'Untitled')}**\n"
+                    f"  URL: {r.get('url', '')}\n"
+                    f"  Content: {r.get('content', '')[:300]}..."
+                )
+            result["web"] = "\n\n".join(web_lines)
+
+            # Include Tavily's AI answer if available
+            if self._external_research.get("web_answer"):
+                result["web"] = f"**Summary:** {self._external_research['web_answer']}\n\n" + result["web"]
+
+            # Include analysis if available
+            analysis = self._external_research.get(
+                "analysis", {}).get("web", {})
+            if analysis:
+                summary = analysis.get("summary", "")
+                if summary:
+                    result["web"] += f"\n\n**Regulatory Context:** {summary}"
+
+        return result
+
+    async def _create_plan(self, state: InvestigationState, repo: MatterRepository):
+        """Phase 1: Create investigation plan using LLM."""
+        self._emit_step(state, StepType.THINKING,
+                        "Analyzing repository structure...")
+
+        stats = repo.get_stats()
+        structure = repo.get_structure()
+        structure_str = "\n".join(
+            f"  {folder}: {count} files" for folder, count in structure.items())
+
+        # Use decisions layer for planning
+        plan = await decisions.create_plan(
+            query=state.query,
+            repo_structure=structure_str,
+            total_files=stats.total_files,
+            client=self.client,
+        )
+
+        state.hypothesis = plan.get("success_criteria", "Investigating query")
+        state.findings["issues"] = plan.get("key_issues", [])
+        state.findings["initial_plan"] = plan
+
+        # Emit the reasoning (show LLM's thinking process)
+        reasoning = plan.get("reasoning", "")
+        challenges = plan.get("potential_challenges", "")
+        key_issues = plan.get("key_issues", [])
+
+        if reasoning:
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"STRATEGY: {reasoning}",
+            )
+        if key_issues:
+            issues_str = ", ".join(key_issues[:3])
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"KEY ISSUES: {issues_str}",
+            )
+        if challenges:
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"CHALLENGES: {challenges}",
+            )
+
+        # Create leads from search terms - LIMIT TO 3
+        for term in plan.get("search_terms", [])[:3]:
+            if isinstance(term, str):
+                state.add_lead(f"Search for: {term}", source="initial_plan")
+
+        # Fallback if no leads
+        if not state.leads:
+            terms = await decisions.extract_search_terms(state.query, self.client)
+            for term in terms[:2]:
+                state.add_lead(f"Search for: {term}", source="fallback")
 
         self._emit_step(
             state,
             StepType.THINKING,
-            f"Hypothesis: {state.hypothesis}",
+            f"Plan created with {len(state.leads)} initial leads",
             details=plan,
         )
 
-    async def _investigate_loop(self, state: InvestigationState, repo: MatterRepository):
-        """Phase 2: Iterative investigation with recursive lead following."""
-        iteration = 0
-        max_iterations = self.config.max_iterations  # Configurable limit
+    async def _execute_external_searches(self, state: InvestigationState):
+        """Execute external searches (case law, web) ONLY when the LLM plan requests them.
 
-        while iteration < max_iterations:
-            # Track facts before this iteration for diminishing returns check
-            facts_before = len(state.findings.get("accumulated_facts", []))
+        This mimics how a real lawyer works:
+        1. First, read the repository documents
+        2. Based on what's found, identify if external research is needed
+        3. Only then search case law or web for specific legal questions
+
+        External searches are TOOLS, not mandatory steps:
+        - Case law: Use when legal precedent questions arise from the documents
+        - Web search: Use when regulations/standards need verification (e.g., state law, industry norms)
+
+        The LLM plan decides what external searches are needed based on:
+        - The nature of the query
+        - What's likely in the repository
+        - What gaps might need external verification
+        """
+        plan = state.findings.get("initial_plan", {})
+        case_law_queries = plan.get("case_law_searches", [])
+        web_queries = plan.get("web_searches", [])
+
+        # Only proceed if the LLM identified external searches as needed
+        if not case_law_queries and not web_queries:
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                "No external research needed - focusing on repository documents",
+            )
+            return
+
+        self._external_research = {"case_law": [], "web": [], "analysis": {}}
+
+        # Execute case law searches
+        if case_law_queries and self.external_search:
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"Searching case law for: {', '.join(case_law_queries[:2])}...",
+            )
+
+            for query in case_law_queries[:2]:  # Limit to 2 case law searches
+                try:
+                    cases = await self.external_search.search_case_law(
+                        query,
+                        max_results=self.config.max_case_law_results
+                    )
+                    if cases:
+                        self._external_research["case_law"].extend(cases)
+                        self._emit_step(
+                            state,
+                            StepType.FINDING,
+                            f"Found {len(cases)} relevant cases for '{query[:30]}...'",
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Case law search failed for '{query}': {e}")
+
+            # Analyze case law results (results are dicts from to_dict())
+            if self._external_research["case_law"]:
+                case_law_text = "\n\n".join([
+                    f"**{c.get('case_name', 'Unknown')}** ({c.get('citation') or 'No citation'})\n"
+                    f"Court: {c.get('court', 'Unknown')}\nDate: {c.get('date_filed', 'Unknown')}\n"
+                    f"Snippet: {(c.get('snippet') or c.get('opinion_text', ''))[:500] if c.get('snippet') or c.get('opinion_text') else 'No summary'}"
+                    for c in self._external_research["case_law"][:5]
+                ])
+
+                analysis = await decisions.analyze_case_law_results(
+                    query=state.query,
+                    case_law_results=case_law_text,
+                    client=self.client,
+                )
+                self._external_research["analysis"]["case_law"] = analysis
+
+        # Execute web searches
+        if web_queries and self.external_search:
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"Searching web for regulations/standards: {', '.join(web_queries[:2])}...",
+            )
+
+            for query in web_queries[:2]:  # Limit to 2 web searches
+                try:
+                    result_data = await self.external_search.search_web(
+                        query,
+                        max_results=self.config.max_web_results
+                    )
+                    # search_web returns dict with 'results' key
+                    web_results = result_data.get("results", [])
+                    if web_results:
+                        self._external_research["web"].extend(web_results)
+                        self._emit_step(
+                            state,
+                            StepType.FINDING,
+                            f"Found {len(web_results)} web results for '{query[:30]}...'",
+                        )
+                    # Also capture the AI-generated answer if available
+                    if result_data.get("answer"):
+                        self._external_research["web_answer"] = result_data["answer"]
+                except Exception as e:
+                    logger.warning(f"Web search failed for '{query}': {e}")
+
+            # Analyze web results (results are dicts)
+            if self._external_research["web"]:
+                web_text = "\n\n".join([
+                    f"**{r.get('title', 'Untitled')}**\nURL: {r.get('url', '')}\n"
+                    f"Content: {r.get('content', 'No content')[:500]}"
+                    for r in self._external_research["web"][:5]
+                ])
+
+                analysis = await decisions.analyze_web_results(
+                    query=state.query,
+                    web_results=web_text,
+                    client=self.client,
+                )
+                self._external_research["analysis"]["web"] = analysis
+
+        # Store in state findings for reference
+        state.findings["external_research"] = self._external_research
+
+        # Add citations for external sources (so they appear in Citations tab)
+        if self._external_research.get("case_law"):
+            for case in self._external_research["case_law"][:5]:
+                citation = state.add_citation(
+                    document=f"[Case Law] {case.get('case_name', 'Unknown Case')}",
+                    page=None,
+                    text=case.get('snippet', '') or case.get(
+                        'opinion_text', '') or '',
+                    context=f"Citation: {case.get('citation', 'N/A')} | Court: {case.get('court', 'N/A')}",
+                    relevance="External case law research",
+                )
+                if citation and self.on_citation:
+                    self.on_citation(citation)
+
+        if self._external_research.get("web"):
+            for result in self._external_research["web"][:5]:
+                citation = state.add_citation(
+                    document=f"[Web] {result.get('title', 'Unknown Source')}",
+                    page=None,
+                    text=result.get('content', '') or '',
+                    context=f"URL: {result.get('url', 'N/A')}",
+                    relevance="External regulatory research",
+                )
+                if citation and self.on_citation:
+                    self.on_citation(citation)
+
+    async def _investigate_loop(
+        self,
+        state: InvestigationState,
+        repo: MatterRepository,
+        cache: InvestigationCache,
+    ):
+        """Phase 2: Iterative investigation with continuous recalibration.
+
+        Mimics how a lawyer works:
+        1. Follow leads, read documents, extract facts
+        2. Continuously assess: Do we have enough? Should we change approach?
+        3. Dynamically decide if external research is needed based on what we find
+        4. Stop when we have sufficient evidence
+        """
+        iteration = 0
+        external_search_triggered = False  # Track if we've done external search
+
+        while iteration < self.config.max_iterations:
+            state.recursion_depth = iteration + 1
 
             pending_leads = state.get_pending_leads()
-
             if not pending_leads:
-                self._emit_step(state, StepType.THINKING, "No more leads to investigate")
+                self._emit_step(state, StepType.THINKING,
+                                "No more leads to investigate")
                 break
 
-            # Take top leads up to limit
-            leads_to_process = [
-                lead for lead in pending_leads[:self.config.max_leads_per_level]
-                if lead.priority >= self.config.min_lead_priority
-            ]
-
-            # Skip low priority leads
-            for lead in pending_leads[:self.config.max_leads_per_level]:
-                if lead.priority < self.config.min_lead_priority:
-                    state.mark_lead_investigated(lead.id, "Skipped - low priority")
-
-            if not leads_to_process:
-                iteration += 1
-                continue
+            # Take leads to process
+            leads_to_process = pending_leads[:self.config.max_leads_per_level]
 
             self._emit_step(
                 state,
                 StepType.THINKING,
-                f"Investigating {len(leads_to_process)} leads in parallel (iteration {iteration + 1})",
+                f"Processing {len(leads_to_process)} leads (iteration {iteration + 1})",
             )
 
             # Process leads in parallel
-            tasks = [
-                self._investigate_lead(state, repo, lead)
-                for lead in leads_to_process
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Log any errors
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error(f"Lead investigation failed: {leads_to_process[i].description}: {result}")
-
-            # Track facts added this iteration for diminishing returns
-            facts_after = len(state.findings.get("accumulated_facts", []))
-            facts_added = facts_after - facts_before
-            state.facts_per_iteration.append(facts_added)
+            tasks = [self._investigate_lead(
+                state, repo, lead, cache) for lead in leads_to_process]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
             iteration += 1
+            facts_count = len(state.findings.get("accumulated_facts", []))
+            findings_summary = self._format_findings(state)
 
-            # Reprioritize leads based on accumulated context
-            if iteration % 2 == 0:  # Every other iteration
-                state.reprioritize_leads()
+            # === RECALIBRATION POINT ===
+            # After each iteration, reassess our approach like a lawyer would
+
+            # 1. Check if we have enough to answer
+            if facts_count >= self.config.early_exit_facts:
+                is_sufficient = await decisions.is_sufficient(
+                    query=state.query,
+                    findings=findings_summary,
+                    client=self.client,
+                )
+
+                if is_sufficient:
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Sufficient evidence gathered ({facts_count} facts)",
+                    )
+                    break
+
+            # 2. Continuous replanning - check if we should change approach
+            # For complex queries, replan frequently based on what we're finding
+            prev_facts_count = state.findings.get("_prev_facts_count", 0)
+            facts_delta = facts_count - prev_facts_count
+            state.findings["_prev_facts_count"] = facts_count
+
+            # Replan if:
+            # - We're not finding new facts (stalled)
+            # - Every iteration for complex queries
+            # - Every 2 iterations for simpler queries
+            is_complex = state.query_classification.get('complexity', 3) >= 3
+            is_stalled = facts_delta < 2 and iteration > 1
+            should_check_replan = is_stalled or (is_complex and iteration > 0) or (
+                iteration > 1 and iteration % 2 == 0)
+
+            if should_check_replan and pending_leads:  # Only replan if we still have work to do
+                plan_summary = state.findings.get(
+                    "initial_plan", {}).get("reasoning", "")
+                should_change = await decisions.should_replan(
+                    query=state.query,
+                    plan=plan_summary,
+                    results=findings_summary,
+                    client=self.client,
+                )
+
+                if should_change:
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Recalibrating... (stalled={is_stalled}, complex={is_complex})",
+                    )
+                    new_plan = await decisions.replan(
+                        query=state.query,
+                        previous_approach=plan_summary,
+                        findings=findings_summary,
+                        client=self.client,
+                    )
+
+                    # Add new leads from replanning
+                    new_leads_added = 0
+                    for term in new_plan.get("search_terms", [])[:3]:
+                        if not cache.is_similar_search(term):
+                            state.add_lead(
+                                f"Search for: {term}", source="replan")
+                            new_leads_added += 1
+                    for filepath in new_plan.get("files_to_check", [])[:2]:
+                        if not cache.has_extracted(filepath):
+                            state.add_lead(
+                                f"Read document: {filepath}", source="replan")
+                            new_leads_added += 1
+
+                    if new_leads_added > 0:
+                        self._emit_step(
+                            state,
+                            StepType.THINKING,
+                            f"Added {new_leads_added} new leads from replanning",
+                        )
+
+                    # Check if replanning suggests external research
+                    if new_plan.get("needs_external_research") and not external_search_triggered:
+                        if "initial_plan" not in state.findings:
+                            state.findings["initial_plan"] = {}
+                        state.findings["initial_plan"]["case_law_searches"] = new_plan.get(
+                            "case_law_searches", [])
+                        state.findings["initial_plan"]["web_searches"] = new_plan.get(
+                            "web_searches", [])
+
+            # 3. Dynamic external search - trigger if we discover we need it
+            # (e.g., found references to case law, regulations, state-specific rules)
+            if not external_search_triggered and self.config.enable_external_search and self.external_search:
+                # Check if findings suggest we need external research
+                needs_external = await self._check_if_external_needed(state)
+                if needs_external:
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        "Findings suggest external legal research would help...",
+                    )
+                    await self._execute_external_searches(state)
+                    external_search_triggered = True
 
             # Save checkpoint periodically
             if self.config.checkpoint_dir and iteration % self.config.checkpoint_interval == 0:
                 self._save_checkpoint(state, iteration)
 
-            # Check if we should continue (adaptive termination)
-            should_continue, termination_reason = self._should_continue_investigation(state)
-            if not should_continue:
-                self._emit_step(
-                    state,
-                    StepType.THINKING,
-                    f"Early termination: {termination_reason}",
-                )
-                break
+    async def _check_if_external_needed(self, state: InvestigationState) -> bool:
+        """Check if accumulated triggers suggest we need external legal research.
+
+        Uses trigger-based approach:
+        1. Check if meaningful triggers have been accumulated from documents
+        2. If yes, use LITE to generate specific queries using those triggers
+        3. If no triggers, skip external search entirely (zero LLM cost)
+
+        Returns True if queries were generated, False otherwise.
+        """
+        # Must have read some documents first
+        if state.documents_read < 2:
+            return False
+
+        # Check if we have meaningful triggers from document analysis
+        if not state.has_external_triggers(min_triggers=2):
+            # No triggers accumulated - skip external search entirely
+            return False
+
+        facts = state.findings.get("accumulated_facts", [])
+        entities = [e.name for e in state.entities.values()
+                    ][:10] if state.entities else []
+        triggers = state.get_trigger_summary()
+
+        self._emit_step(
+            state,
+            StepType.THINKING,
+            f"Research triggers found: {triggers[:100]}...",
+        )
+
+        # Generate specific queries using accumulated triggers
+        result = await decisions.generate_external_queries(
+            query=state.query,
+            facts=facts,
+            entities=entities,
+            client=self.client,
+            triggers=triggers,
+        )
+
+        case_law_queries = result.get("case_law_queries", [])
+        web_queries = result.get("web_queries", [])
+
+        # If any queries were generated, store them for execution
+        if case_law_queries or web_queries:
+            if "initial_plan" not in state.findings:
+                state.findings["initial_plan"] = {}
+            state.findings["initial_plan"]["case_law_searches"] = case_law_queries
+            state.findings["initial_plan"]["web_searches"] = web_queries
+
+            self._emit_step(
+                state,
+                StepType.THINKING,
+                f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
+            )
+            return True
+
+        return False
 
     async def _investigate_lead(
         self,
         state: InvestigationState,
         repo: MatterRepository,
         lead: Lead,
+        cache: InvestigationCache,
     ):
-        """Investigate a single lead - may spawn sub-investigations."""
-        # Acquire semaphore to limit concurrent heavy operations
-        async with self._get_semaphore():
-            state.recursion_depth += 1
-            state.max_depth_reached = max(state.max_depth_reached, state.recursion_depth)
+        """Investigate a single lead with caching."""
+        if state.recursion_depth > self.config.max_depth:
+            state.mark_lead_investigated(lead.id, "Max depth reached")
+            return
 
-            try:
-                effective_depth = self._calculate_effective_depth(state)
-                if state.recursion_depth > effective_depth:
-                    state.mark_lead_investigated(lead.id, f"Max depth ({effective_depth}) reached")
-                    return
+        if state.recursion_depth > state.max_depth_reached:
+            state.max_depth_reached = state.recursion_depth
 
-                self._emit_step(state, StepType.SEARCH, f"Investigating: {lead.description}")
+        # Determine if this is a search or read lead
+        if lead.description.startswith("Read document:"):
+            filepath = lead.description.replace("Read document:", "").strip()
 
-                # Extract search term from lead
-                search_term = self._extract_search_term(lead.description)
+            # OPTIMIZATION: Skip if already extracted
+            if cache.has_extracted(filepath):
+                state.mark_lead_investigated(lead.id, "Already extracted")
+                return
 
-                # Perform search (scale workers based on doc count)
-                max_workers = min(4, max(1, self._doc_count))
-                results = repo.search(search_term, context_lines=3, max_workers=max_workers)
-                state.searches_performed += 1
+            await self._read_document(state, repo, filepath, cache)
+            state.mark_lead_investigated(lead.id, "Document read")
+        else:
+            # Extract search term
+            search_term = self._extract_search_term(lead.description)
 
-                if not results.hits:
-                    state.mark_lead_investigated(lead.id, "No results found")
-                    return
+            # OPTIMIZATION: Skip similar searches
+            if self.config.skip_similar_searches and cache.is_similar_search(search_term):
+                state.mark_lead_investigated(
+                    lead.id, f"Similar search already done")
+                logger.info(f"Skipping similar search: {search_term}")
+                return
 
-                self._emit_step(
-                    state,
-                    StepType.FINDING,
-                    f"Found {len(results.hits)} matches in {results.files_searched} files",
+            cache.add_search(search_term)
+            self._emit_step(state, StepType.SEARCH,
+                            f"Searching: {search_term}")
+
+            # Perform search (using smart_search for OR fallback)
+            results = repo.smart_search(search_term, context_lines=2)
+            state.searches_performed += 1
+
+            if not results.hits:
+                state.mark_lead_investigated(lead.id, "No results found")
+                return
+
+            self._emit_step(
+                state,
+                StepType.FINDING,
+                f"Found {len(results.hits)} matches",
+            )
+
+            # OPTIMIZATION: Skip LLM call if <= 15 results (long-context LLMs handle this fine)
+            if len(results.hits) <= 15:
+                relevant_hits = results.hits
+                logger.info(
+                    f"Skipping pick_relevant_hits: only {len(results.hits)} results")
+            else:
+                # Let LLM pick the most relevant hits
+                relevant_hits = await decisions.pick_relevant_hits(
+                    query=state.query,
+                    results=results,
+                    client=self.client,
                 )
 
-                # Analyze top results
-                await self._analyze_search_results(state, repo, results, lead)
+            # Analyze results and read docs (with caching)
+            await self._analyze_results(state, repo, results, relevant_hits, cache)
+            state.mark_lead_investigated(
+                lead.id, f"Found {len(results.hits)} matches")
 
-                state.mark_lead_investigated(lead.id, f"Found {len(results.hits)} matches")
-
-            finally:
-                state.recursion_depth -= 1
-
-    async def _analyze_search_results(
+    async def _analyze_results(
         self,
         state: InvestigationState,
         repo: MatterRepository,
         results: SearchResults,
-        lead: Lead,
+        relevant_hits: list,
+        cache: InvestigationCache,
     ):
-        """Analyze search results and extract findings/leads."""
-        # Format results for LLM
-        results_text = self._format_search_results(results)
-
-        prompt = ANALYZE_FINDINGS_PROMPT.format(
+        """Analyze search results using LLM."""
+        # Use decisions layer to analyze
+        analysis = await decisions.analyze_results(
             query=state.query,
-            hypothesis=state.hypothesis or "No hypothesis yet",
-            search_term=results.query,
-            search_results=results_text,
+            results=results,
+            client=self.client,
         )
 
-        # Use FLASH for analysis
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
+        # Store facts
+        facts = analysis.get("facts", [])
+        state.add_facts(facts)
 
-        # Parse with safe defaults
-        analysis = self._parse_json_safe(response, {
-            "key_facts": [],
-            "new_leads": [],
-            "hypothesis_update": None,
-            "next_searches": [],
-        })
-
-        # Store key facts with deduplication
-        # key_facts can be strings or dicts with "fact" key
-        if analysis.get("key_facts"):
-            facts_to_add = []
-            for fact_item in analysis["key_facts"]:
-                if isinstance(fact_item, str):
-                    facts_to_add.append(fact_item)
-                elif isinstance(fact_item, dict) and "fact" in fact_item:
-                    facts_to_add.append(fact_item["fact"])
-            state.add_facts(facts_to_add)
-
-        # Update hypothesis if changed
-        if analysis.get("hypothesis_update"):
-            state.hypothesis = analysis["hypothesis_update"]
-            self._emit_step(
-                state,
-                StepType.REPLAN,
-                f"Hypothesis updated: {state.hypothesis}",
-            )
-
-        # Add citations from top hits
-        for hit in results.top(5):
+        # Add citations from relevant hits (limit to 3)
+        for hit in relevant_hits[:3]:
             citation = state.add_citation(
-                document=hit.filename,
+                document=hit.file_path,
                 page=hit.page_num,
-                text=hit.match_text[:200],
-                context=hit.context[:500],
+                text=hit.match_text,
+                context=hit.context,
                 relevance=f"Found via search: {results.query}",
             )
-            if self.on_citation:
+            if citation and self.on_citation:
                 self.on_citation(citation)
 
-        # Add new leads (handle both "description" and compact "desc" formats)
-        for lead_data in analysis.get("new_leads", [])[:3]:
-            if isinstance(lead_data, dict):
-                desc = lead_data.get("description") or lead_data.get("desc")
-                if desc:
-                    state.add_lead(
-                        description=desc,
-                        source=f"Analysis of '{results.query}'",
-                        priority=lead_data.get("priority", 0.5),
-                    )
+        # OPTIMIZATION: Only add leads for docs we haven't extracted
+        for filepath in analysis.get("read_deeper", [])[:2]:
+            if isinstance(filepath, str) and not cache.has_extracted(filepath):
+                state.add_lead(f"Read document: {filepath}", source="analysis")
 
-        # Deep read top documents in parallel
-        top_files = list(results.by_file().keys())[:self.config.parallel_reads]
-        if top_files:
-            await self._batch_deep_read(state, repo, top_files)
+        # OPTIMIZATION: Limit additional searches
+        for term in analysis.get("additional_searches", [])[:1]:
+            if isinstance(term, str) and not cache.is_similar_search(term):
+                state.add_lead(f"Search for: {term}", source="analysis")
 
-    async def _batch_deep_read(
+        # Get candidate files from search results
+        candidate_files = list(results.by_file().keys())
+
+        # OPTIMIZATION: Dynamic document prioritization using LLM
+        if candidate_files:
+            key_issues = state.findings.get("issues", [])
+            already_read = list(cache.extracted_docs)
+
+            prioritized_files = await decisions.prioritize_documents(
+                query=state.query,
+                candidate_files=candidate_files,
+                already_read=already_read,
+                key_issues=key_issues,
+                client=self.client,
+            )
+
+            # Filter to unread files only
+            top_files = [
+                f for f in prioritized_files if not cache.has_extracted(f)]
+        else:
+            top_files = []
+
+        await self._batch_read(state, repo, top_files[:self.config.parallel_reads], cache)
+
+    async def _batch_read(
         self,
         state: InvestigationState,
         repo: MatterRepository,
         file_paths: list[str],
+        cache: InvestigationCache,
     ):
-        """Process multiple documents with controlled parallelism."""
-        if not file_paths:
+        """Read multiple documents in parallel."""
+        # Filter out already extracted docs
+        to_read = [fp for fp in file_paths if not cache.has_extracted(fp)]
+
+        if not to_read:
             return
 
         self._emit_step(
             state,
             StepType.READING,
-            f"Deep reading {len(file_paths)} documents",
+            f"Reading {len(to_read)} documents",
         )
 
-        # Use semaphore to limit concurrent document processing
-        # This prevents CPU overload from too many parallel PDF parses + LLM calls
-        read_semaphore = asyncio.Semaphore(self.config.parallel_reads)
+        tasks = [self._read_document(state, repo, fp, cache) for fp in to_read]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        async def limited_read(fp: str):
-            async with read_semaphore:
-                return await self._deep_read_document(state, repo, fp)
-
-        tasks = [limited_read(fp) for fp in file_paths]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Log any errors
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Document read failed: {file_paths[i]}: {result}")
-
-    async def _deep_read_document(
+    async def _read_document(
         self,
         state: InvestigationState,
         repo: MatterRepository,
         file_path: str,
+        cache: InvestigationCache,
     ):
-        """Perform deep analysis of a document."""
-        self._emit_step(state, StepType.READING, f"Deep reading: {Path(file_path).name}")
+        """Read and extract facts from a document."""
+        # OPTIMIZATION: Skip if already extracted
+        if cache.has_extracted(file_path):
+            logger.debug(f"Skipping already extracted: {file_path}")
+            return
+
+        self._emit_step(state, StepType.READING,
+                        f"Reading: {Path(file_path).name}")
 
         try:
             doc = repo.read(file_path)
             state.documents_read += 1
+            cache.mark_extracted(file_path)  # Mark as extracted
 
-            # Use excerpt for analysis
-            content = doc.get_excerpt(self.config.excerpt_chars)
+            # Dynamic excerpt limit based on query complexity
+            excerpt_limit = (
+                self.config.excerpt_chars_simple
+                if getattr(self, '_is_simple_query', False)
+                else self.config.excerpt_chars_complex
+            )
+            content = doc.get_excerpt(excerpt_limit)
 
-            prompt = DEEP_READ_PROMPT.format(
-                filename=doc.filename,
-                page_range=f"1-{doc.page_count}",
-                content=content,
+            # Dynamic extraction limit (matching excerpt)
+            extraction_limit = 10000 if getattr(
+                self, '_is_simple_query', False) else 35000
+
+            # Use decisions layer to extract facts
+            extraction = await decisions.extract_facts(
                 query=state.query,
-                focus=state.hypothesis or state.query,
+                filename=doc.filename,
+                content=content,
+                client=self.client,
+                max_content_chars=extraction_limit,
             )
 
-            # Use LITE for bulk reading
-            response = await self.client.complete(prompt, tier=ModelTier.LITE)
+            # Store facts
+            facts = extraction.get("facts", [])
+            if facts:
+                self._emit_step(
+                    state,
+                    StepType.FINDING,
+                    f"Found {len(facts)} facts in {doc.filename}",
+                )
+            state.add_facts(facts)
 
-            analysis = self._parse_json_safe(response, {
-                "key_facts": [],
-                "quotes": [],
-                "entities": {"people": [], "companies": [], "dates": []},
-                "connections": [],
-                "concerns": [],
-            })
+            # Accumulate external research triggers
+            triggers = extraction.get("external_triggers", {})
+            if triggers:
+                added = state.add_triggers(triggers)
+                if added > 0:
+                    self._emit_step(
+                        state,
+                        StepType.THINKING,
+                        f"Noted {added} research trigger(s) from {doc.filename}",
+                    )
 
-            # Add quotes as citations
-            for quote in analysis.get("quotes", [])[:3]:
+            # Emit insights from the extraction (show LLM's thinking)
+            insights = extraction.get("insights", "")
+            gaps = extraction.get("gaps", "")
+            next_steps = extraction.get("next_steps", "")
+
+            if insights or gaps:
+                insight_msg = f"From {doc.filename}:\n"
+                if insights:
+                    insight_msg += f"  LEARNED: {insights}\n"
+                if gaps:
+                    insight_msg += f"  GAPS: {gaps}\n"
+                if next_steps:
+                    insight_msg += f"  NEXT: {next_steps}"
+                self._emit_step(state, StepType.THINKING, insight_msg.strip())
+
+            # Add citations from quotes (limit to 2)
+            for quote in extraction.get("quotes", [])[:2]:
                 if isinstance(quote, dict) and "text" in quote:
                     citation = state.add_citation(
-                        document=doc.filename,
+                        document=doc.path,
                         page=quote.get("page"),
-                        text=quote["text"][:300],
+                        text=quote["text"],
                         context="",
                         relevance=quote.get("relevance", "Direct quote"),
                     )
-                    if self.on_citation:
+                    if citation and self.on_citation:
                         self.on_citation(citation)
 
-            # Store findings with deduplication
-            # key_facts can be strings or dicts with "fact" key
-            if analysis.get("key_facts"):
-                facts_to_add = []
-                for fact_item in analysis["key_facts"]:
-                    if isinstance(fact_item, str):
-                        facts_to_add.append(fact_item)
-                    elif isinstance(fact_item, dict) and "fact" in fact_item:
-                        facts_to_add.append(fact_item["fact"])
-                state.add_facts(facts_to_add)
-
-            # Extract and store entities
-            if analysis.get("entities"):
-                state.add_entities_from_analysis(analysis["entities"], doc.filename)
-
-            # Add leads for mentioned entities/connections
-            for concern in analysis.get("concerns", [])[:2]:
-                if isinstance(concern, str):
-                    state.add_lead(
-                        description=f"Investigate concern: {concern}",
-                        source=doc.filename,
-                        priority=0.6,
-                    )
+            # Skip adding reference leads - reduces iteration depth
 
         except Exception as e:
-            self._emit_step(state, StepType.ERROR, f"Failed to read {file_path}: {e}")
+            self._emit_step(state, StepType.ERROR,
+                            f"Failed to read {file_path}: {e}")
 
-    async def _verify_citations(self, state: InvestigationState, repo: MatterRepository):
-        """Verify citations by checking if quoted text exists in documents."""
-        unverified = state.get_unverified_citations()
-        if not unverified:
-            return
+    async def _synthesize(self, state: InvestigationState, is_simple: bool = False):
+        """Phase 3: Final synthesis using ALL THREE sources.
 
-        self._emit_step(state, StepType.VERIFY, f"Verifying {len(unverified)} citations...")
+        Sources:
+        1. Local document search (facts and citations from repo)
+        2. Case law search (CourtListener)
+        3. Web search (Tavily - regulations/standards)
+        """
+        self._emit_step(state, StepType.SYNTHESIS,
+                        "Synthesizing from all sources...")
 
-        verified_count = 0
-        unverified_count = 0
-
-        for citation in unverified:
-            try:
-                # Try to find the document
-                doc = repo.read(citation.document)
-
-                # Normalize text for comparison (lowercase, collapse whitespace)
-                citation_text = " ".join(citation.text.lower().split())
-                doc_text = " ".join(doc.full_text.lower().split())
-
-                # Check if a significant portion of the citation exists in the document
-                # Use first 50 chars for matching (handles truncation)
-                search_text = citation_text[:50]
-
-                if search_text in doc_text:
-                    citation.verified = True
-                    citation.verification_note = "Text found in document"
-                    verified_count += 1
-                else:
-                    # Try fuzzy match - look for any 20-char substring
-                    found = False
-                    for i in range(0, min(len(citation_text) - 20, 100), 10):
-                        chunk = citation_text[i:i+20]
-                        if chunk in doc_text:
-                            citation.verified = True
-                            citation.verification_note = "Partial text match found"
-                            verified_count += 1
-                            found = True
-                            break
-
-                    if not found:
-                        citation.verified = False
-                        citation.verification_note = "Text not found in document"
-                        unverified_count += 1
-
-            except Exception as e:
-                citation.verified = False
-                citation.verification_note = f"Could not verify: {e}"
-                unverified_count += 1
-
-        stats = state.get_verification_stats()
-        self._emit_step(
-            state,
-            StepType.VERIFY,
-            f"Verification complete: {stats['verified']} verified, {stats['unverified']} unverified",
-        )
-
-    async def _synthesize(self, state: InvestigationState):
-        """Phase 3: Final synthesis using Pro model."""
-        self._emit_step(state, StepType.SYNTHESIS, "Synthesizing final analysis...")
-
-        # Compile all findings
+        # SOURCE 1: Local document evidence
         facts = state.findings.get("accumulated_facts", [])
-        findings_text = "\n".join(f"• {fact}" for fact in facts[:30])
+        evidence = "\n".join(f"- {fact}" for fact in facts[:20])
+        citations = state.get_citations_formatted()
 
-        # Get citations with verification status
-        citations_text = state.get_citations_formatted()
+        # SOURCES 2 & 3: External research (case law + web)
+        external_formatted = self._format_external_research()
+        case_law_text = external_formatted.get("case_law", "No case law found")
+        web_text = external_formatted.get("web", "No web results found")
 
-        # Get entity summary
-        entities_text = state.get_entities_formatted()
+        # Track sources used
+        state.findings["sources_used"] = [
+            "local_documents", "case_law", "web_search"]
 
-        prompt = SYNTHESIS_PROMPT.format(
-            query=state.query,
-            docs_analyzed=state.documents_read,
-            searches=state.searches_performed,
-            citation_count=len(state.citations),
-            max_depth=state.max_depth_reached,
-            hypothesis=state.hypothesis or "No specific hypothesis formed",
-            entities=entities_text or "No entities identified",
-            findings=findings_text or "No specific findings accumulated",
-            citations=citations_text or "No citations collected",
-        )
-
-        # Use PRO for final synthesis
-        response = await self.client.complete(prompt, tier=ModelTier.PRO)
+        # OPTIMIZATION: Use FLASH for simple queries
+        if is_simple and self.config.use_flash_for_simple:
+            logger.info("Using FLASH model for simple query synthesis")
+            response = await decisions.synthesize_simple(
+                query=state.query,
+                evidence=evidence or "No specific findings accumulated",
+                citations=citations or "No citations collected",
+                client=self.client,
+            )
+        else:
+            # Full synthesis with all three sources clearly separated
+            response = await decisions.synthesize(
+                query=state.query,
+                evidence=evidence or "No specific findings accumulated",
+                citations=citations or "No citations collected",
+                external_research=f"=== CASE LAW (CourtListener) ===\n{case_law_text}\n\n=== REGULATIONS/STANDARDS (Web) ===\n{web_text}",
+                client=self.client,
+            )
 
         state.findings["final_output"] = response
-        self._emit_step(state, StepType.SYNTHESIS, "Analysis complete")
-
-    # ==========================================================================
-    # Units 21-25: Advanced Analysis Methods
-    # ==========================================================================
-
-    async def extract_entities_from_text(
-        self,
-        text: str,
-        filename: str = "unknown",
-    ) -> dict:
-        """
-        Extract entities from text using LLM analysis.
-
-        Args:
-            text: Text to analyze
-            filename: Source filename for context
-
-        Returns:
-            Dict with categorized entities
-        """
-        prompt = ENTITY_EXTRACTION_PROMPT.format(
-            filename=filename,
-            text=text[:5000],  # Limit text size
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.LITE)
-
-        defaults = {
-            "people": [],
-            "organizations": [],
-            "dates": [],
-            "amounts": [],
-            "locations": [],
-            "legal_refs": [],
-        }
-
-        return self._parse_json_safe(response, defaults)
-
-    async def detect_contradiction(
-        self,
-        doc1_name: str,
-        statement1: str,
-        context1: str,
-        doc2_name: str,
-        statement2: str,
-        context2: str,
-    ) -> dict:
-        """
-        Analyze two statements for potential contradictions.
-
-        Args:
-            doc1_name: Name of first document
-            statement1: First statement
-            context1: Context around first statement
-            doc2_name: Name of second document
-            statement2: Second statement
-            context2: Context around second statement
-
-        Returns:
-            Dict with contradiction analysis
-        """
-        prompt = CONTRADICTION_DETECTION_PROMPT.format(
-            doc1_name=doc1_name,
-            statement1=statement1,
-            context1=context1,
-            doc2_name=doc2_name,
-            statement2=statement2,
-            context2=context2,
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "is_contradiction": False,
-            "contradiction_type": "none",
-            "severity": "none",
-            "explanation": "Unable to analyze",
-            "reconciliation_possible": True,
-            "reconciliation_theory": None,
-            "legal_significance": "Unknown",
-            "follow_up_needed": [],
-        }
-
-        return self._parse_json_safe(response, defaults)
-
-    async def build_timeline(
-        self,
-        state: InvestigationState,
-    ) -> dict:
-        """
-        Build a timeline from accumulated evidence in investigation state.
-
-        Args:
-            state: InvestigationState with findings
-
-        Returns:
-            Dict with chronology and analysis
-        """
-        # Collect all date-related information from state
-        events = []
-
-        # From timeline events in state
-        for event in state.timeline:
-            events.append({
-                "date": event.date_str,
-                "event": event.description,
-                "source": event.source_doc,
-            })
-
-        # From entity dates
-        for key, entity in state.entities.items():
-            if entity.entity_type == "date":
-                events.append({
-                    "date": entity.name,
-                    "event": entity.context or "Date mentioned",
-                    "source": entity.sources[0] if entity.sources else "unknown",
-                })
-
-        document_list = "\n".join(f"- {doc}" for doc in set(
-            e.get("source", "unknown") for e in events
-        ))
-
-        events_text = "\n".join(
-            f"- {e.get('date', 'unknown')}: {e.get('event', 'unknown')} (from {e.get('source', 'unknown')})"
-            for e in events
-        )
-
-        prompt = TIMELINE_EXTRACTION_PROMPT.format(
-            document_list=document_list or "No documents",
-            events=events_text or "No events found",
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "chronology": [],
-            "timeline_gaps": [],
-            "date_conflicts": [],
-            "key_periods": [],
-        }
-
-        return self._parse_json_safe(response, defaults)
-
-    async def assess_claim_evidence(
-        self,
-        claim: str,
-        state: InvestigationState,
-    ) -> dict:
-        """
-        Assess the strength of evidence for a specific claim.
-
-        Args:
-            claim: The claim to assess
-            state: InvestigationState with evidence
-
-        Returns:
-            Dict with evidence assessment
-        """
-        # Gather supporting and contradicting evidence
-        supporting = []
-        contradicting = []
-
-        # Search facts for relevant evidence
-        facts = state.findings.get("accumulated_facts", [])
-        for fact in facts:
-            # Simple relevance check
-            if any(word in fact.lower() for word in claim.lower().split()[:5]):
-                supporting.append(fact)
-
-        # Check for contradictions
-        for contradiction in state.contradictions:
-            if claim.lower() in contradiction.statement1.lower() or claim.lower() in contradiction.statement2.lower():
-                contradicting.append(f"{contradiction.statement1} vs {contradiction.statement2}")
-
-        prompt = EVIDENCE_ASSESSMENT_PROMPT.format(
-            claim=claim,
-            supporting_evidence="\n".join(f"- {e}" for e in supporting[:10]) or "No direct supporting evidence found",
-            contradicting_evidence="\n".join(f"- {e}" for e in contradicting[:5]) or "No contradicting evidence found",
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "claim": claim,
-            "evidence_classification": {
-                "direct": [],
-                "circumstantial": [],
-                "primary_sources": [],
-                "secondary_sources": [],
-                "hearsay_concerns": [],
-            },
-            "corroboration_level": "unknown",
-            "authentication_assessment": "unknown",
-            "overall_strength": "unknown",
-            "strength_score": 0,
-            "reasoning": "Unable to assess",
-            "vulnerabilities": [],
-            "strengthening_opportunities": [],
-        }
-
-        return self._parse_json_safe(response, defaults)
-
-    # ==========================================================================
-    # Units 26-30: Utility Improvements
-    # ==========================================================================
-
-    def estimate_completion(self, state: InvestigationState) -> dict:
-        """
-        Estimate investigation completion percentage and remaining work.
-
-        Args:
-            state: Current investigation state
-
-        Returns:
-            Dict with completion estimates
-        """
-        # Calculate based on multiple factors
-        factors = {}
-
-        # Leads completion
-        total_leads = len(state.leads)
-        investigated_leads = len([l for l in state.leads if l.status == "investigated"])
-        factors["leads_complete"] = (investigated_leads / max(total_leads, 1)) * 100
-
-        # Depth progress
-        factors["depth_progress"] = (state.max_depth_reached / self.config.max_depth) * 100
-
-        # Citation coverage
-        target_citations = 10  # Minimum target
-        factors["citation_coverage"] = min(100, (len(state.citations) / target_citations) * 100)
-
-        # Document coverage
-        target_docs = 5  # Minimum target
-        factors["doc_coverage"] = min(100, (state.documents_read / target_docs) * 100)
-
-        # Confidence
-        confidence = state.get_confidence_score()
-        factors["confidence"] = confidence["score"]
-
-        # Weighted average
-        weights = {
-            "leads_complete": 0.3,
-            "depth_progress": 0.1,
-            "citation_coverage": 0.25,
-            "doc_coverage": 0.15,
-            "confidence": 0.2,
-        }
-
-        overall = sum(factors[k] * weights[k] for k in weights)
-
-        # Estimate remaining
-        pending_leads = len(state.get_pending_leads())
-        estimated_remaining_iterations = min(pending_leads, 10)
-
-        return {
-            "overall_progress": round(overall, 1),
-            "factors": factors,
-            "pending_leads": pending_leads,
-            "estimated_remaining_iterations": estimated_remaining_iterations,
-            "is_complete": overall >= 90 or (
-                confidence["score"] >= 80 and len(state.citations) >= 10
-            ),
-        }
-
-    def get_investigation_summary(self, state: InvestigationState) -> dict:
-        """
-        Generate a summary of the current investigation state.
-
-        Args:
-            state: Investigation state
-
-        Returns:
-            Dict with investigation summary
-        """
-        return {
-            "id": state.id,
-            "query": state.query,
-            "status": state.status,
-            "started_at": state.started_at,
-            "documents_read": state.documents_read,
-            "searches_performed": state.searches_performed,
-            "citations_found": len(state.citations),
-            "verified_citations": len([c for c in state.citations if c.verified]),
-            "entities_extracted": len(state.entities),
-            "leads_total": len(state.leads),
-            "leads_pending": len(state.get_pending_leads()),
-            "leads_investigated": len([l for l in state.leads if l.status == "investigated"]),
-            "max_depth_reached": state.max_depth_reached,
-            "contradictions_found": len(state.contradictions),
-            "timeline_events": len(state.timeline),
-            "confidence": state.get_confidence_score(),
-            "completion": self.estimate_completion(state),
-        }
+        self._emit_step(state, StepType.SYNTHESIS,
+                        "Analysis complete (3 sources: docs, case law, web)")
 
     def _emit_step(
         self,
@@ -1416,7 +1176,6 @@ class RLMEngine:
         step = state.add_step(step_type, content, details)
         if self.on_step:
             self.on_step(step)
-        # Also emit progress update
         self._emit_progress(state)
 
     def _emit_progress(self, state: InvestigationState):
@@ -1424,118 +1183,8 @@ class RLMEngine:
         if self.on_progress:
             self.on_progress(state.get_progress())
 
-    def _calculate_effective_depth(self, state: InvestigationState) -> int:
-        """Calculate effective max depth based on investigation progress."""
-        if not self.config.adaptive_depth:
-            return self.config.max_depth
-
-        base_depth = self.config.max_depth
-
-        # Reduce depth if we have many citations already
-        if len(state.citations) >= self.config.depth_citation_threshold:
-            return max(self.config.min_depth, base_depth - 2)
-
-        # Reduce depth if confidence is high
-        confidence = state.get_confidence_score()
-        if confidence["score"] >= 70:
-            return max(self.config.min_depth, base_depth - 1)
-
-        # Increase depth if we have few leads
-        pending_leads = len(state.get_pending_leads())
-        if pending_leads > 10:
-            return min(base_depth + 1, 7)  # Cap at 7
-
-        return base_depth
-
-    def _should_continue_investigation(self, state: InvestigationState) -> tuple[bool, str]:
-        """Determine if investigation should continue.
-
-        Uses four criteria:
-        1. Repository size - small repos terminate faster
-        2. Query complexity - simpler queries terminate faster
-        3. Diminishing returns - stop if recent iterations add few new facts
-        4. Verified citations - keep this requirement (per user preference)
-
-        Returns:
-            (should_continue, reason) - reason explains why we stopped/continue
-        """
-        # Always continue if minimum criteria not met
-        if state.max_depth_reached < self.config.min_depth:
-            return True, "Building minimum evidence base"
-
-        confidence = state.get_confidence_score()
-
-        # Get query complexity thresholds based on query type
-        query_type = state.query_classification.get("type", "unknown") if state.query_classification else "unknown"
-        complexity = state.query_classification.get("complexity", 3) if state.query_classification else 3
-
-        # Define thresholds per query type (confidence_threshold, min_citations)
-        thresholds = {
-            "factual": (60, 5),      # Simple fact lookup - terminate quickly
-            "procedural": (65, 6),   # Process/timeline questions
-            "analytical": (75, 8),   # Deeper analysis needed
-            "comparative": (80, 10), # Need multiple perspectives
-            "evaluative": (85, 12),  # Most thorough investigation
-            "unknown": (70, 7),      # Default middle ground
-        }
-
-        conf_threshold, min_citations = thresholds.get(query_type, (70, 7))
-
-        # Adjust thresholds based on complexity (1-5 scale)
-        # Lower complexity = lower threshold, higher complexity = higher threshold
-        complexity_adjustment = (complexity - 3) * 5  # -10 to +10 adjustment
-        conf_threshold = max(50, min(90, conf_threshold + complexity_adjustment))
-
-        # NEW: Adjust thresholds for small document sets
-        # With fewer documents, we need fewer citations and can terminate earlier
-        if self._doc_count <= 5:
-            min_citations = min(min_citations, max(2, self._doc_count))
-            conf_threshold = max(40, conf_threshold - 15)
-        elif self._doc_count <= 10:
-            min_citations = min(min_citations, self._doc_count)
-            conf_threshold = max(45, conf_threshold - 10)
-
-        # Check 1: Query complexity-aware confidence check
-        if confidence["score"] >= conf_threshold and len(state.citations) >= min_citations:
-            return False, f"Sufficient evidence for {query_type} query (confidence: {confidence['score']:.0f}%, {len(state.citations)} citations)"
-
-        # Check 2: For small repos, terminate if we've read all documents
-        if self._doc_count > 0 and state.documents_read >= self._doc_count:
-            if len(state.citations) >= 1:  # At least some evidence found
-                return False, f"All {self._doc_count} documents processed"
-
-        # Check 3: Diminishing returns - stop if last 2 iterations added < 3 facts each
-        # For small repos, be more aggressive (< 2 facts)
-        fact_threshold = 2 if self._doc_count <= 5 else 3
-        if len(state.facts_per_iteration) >= 2:
-            recent_facts = state.facts_per_iteration[-2:]
-            if all(f < fact_threshold for f in recent_facts):
-                # Diminishing returns detected - but only stop if we have SOME evidence
-                min_citations_for_stop = 2 if self._doc_count <= 5 else 3
-                if len(state.citations) >= min_citations_for_stop and confidence["score"] >= 40:
-                    return False, f"Diminishing returns (last 2 iterations: {recent_facts[0]}, {recent_facts[1]} new facts)"
-
-        # Check 4: Extreme diminishing returns - 3 iterations with 0-1 facts each
-        if len(state.facts_per_iteration) >= 3:
-            recent_facts = state.facts_per_iteration[-3:]
-            if all(f <= 1 for f in recent_facts):
-                # Very low productivity - stop regardless
-                return False, f"Very low productivity (last 3 iterations: {recent_facts} new facts each)"
-
-        # Check if we have pending leads worth investigating
-        pending = state.get_pending_leads()
-        high_priority = [l for l in pending if l.priority >= 0.5]
-        if not high_priority:
-            return False, "No high-priority leads remaining"
-
-        return True, f"Continuing investigation ({len(high_priority)} leads, confidence: {confidence['score']:.0f}%)"
-
     def _extract_search_term(self, lead_description: str) -> str:
-        """Extract a SINGLE high-value search term from lead description.
-
-        The search system uses literal string matching, not boolean operators.
-        We must return a single term that's likely to find relevant documents.
-        """
+        """Extract search term from lead description."""
         import re
 
         # Remove common prefixes
@@ -1546,125 +1195,60 @@ class RLMEngine:
                 term = term[len(prefix):].strip()
                 break
 
-        # Remove boolean operators and quotes
-        term = re.sub(r'\bAND\b|\bOR\b|\bNOT\b', ' ', term, flags=re.IGNORECASE)
+        # Clean up
+        term = re.sub(r'\bAND\b|\bOR\b|\bNOT\b',
+                      ' ', term, flags=re.IGNORECASE)
         term = re.sub(r'[\'\"()]', ' ', term)
         term = re.sub(r'\s+', ' ', term).strip()
 
-        # Extract all meaningful words
-        stopwords = {'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into',
-                     'about', 'which', 'when', 'where', 'what', 'how', 'who', 'why',
-                     'any', 'all', 'each', 'between', 'related', 'regarding', 'concerning'}
+        return term[:50] if term else "contract"
 
-        words = [w for w in term.split()
-                 if len(w) > 2 and w.lower() not in stopwords and not w.startswith('$')]
+    def _format_findings(self, state: InvestigationState) -> str:
+        """Format current findings for LLM."""
+        facts = state.findings.get("accumulated_facts", [])
+        citations_count = len(state.citations)
+        docs_read = state.documents_read
 
-        if not words:
-            # Fallback: use any word over 3 chars
-            words = [w for w in term.split() if len(w) > 3]
+        lines = [
+            f"Documents read: {docs_read}",
+            f"Citations found: {citations_count}",
+            "",
+            "Key facts found:",
+        ]
 
-        if not words:
-            return term[:50]  # Last resort
+        for fact in facts[:15]:  # Limit facts in summary
+            lines.append(f"- {fact}")
 
-        # Priority: specific terms > generic terms
-        # Look for entity-like words (capitalized, numbers, specific patterns)
-        priority_words = []
+        if not facts:
+            lines.append("- No facts extracted yet")
 
-        # 1. Specific dollar amounts or numbers
-        for w in words:
-            if re.match(r'^\$?[\d,.]+[MKBmkb]?$', w):  # $3.1M, 192, etc.
-                priority_words.append(w)
-
-        # 2. Proper nouns / entity names (capitalized words)
-        for w in words:
-            if w[0].isupper() and len(w) > 2:
-                priority_words.append(w)
-
-        # 3. Legal-specific terms
-        legal_terms = {'contract', 'agreement', 'breach', 'damages', 'liability',
-                       'warranty', 'negligence', 'fraud', 'misrepresentation',
-                       'estimate', 'inspection', 'maintenance', 'invoice', 'payment'}
-        for w in words:
-            if w.lower() in legal_terms:
-                priority_words.append(w)
-
-        # Use the highest priority word found, or fall back to first meaningful word
-        if priority_words:
-            return priority_words[0]
-
-        return words[0]
-
-    def _format_search_results(self, results: SearchResults, max_hits: int = 10) -> str:
-        """Format search results for LLM consumption."""
-        lines = []
-        for hit in results.top(max_hits):
-            lines.append(f"File: {hit.filename} (page {hit.page_num})")
-            lines.append(f"Match: {hit.match_text}")
-            if hit.context_before:
-                lines.append(f"Context before: {' '.join(hit.context_before)}")
-            if hit.context_after:
-                lines.append(f"Context after: {' '.join(hit.context_after)}")
-            lines.append("---")
         return "\n".join(lines)
-
-    def _parse_json_safe(self, text: str, defaults: dict) -> dict:
-        """Parse JSON from LLM response with safe fallback to defaults."""
-        try:
-            if not text or not text.strip():
-                logger.warning("Empty LLM response, using defaults")
-                return defaults
-
-            json_str = self._extract_json(text)
-            if not json_str or json_str == text and "{" not in text:
-                logger.warning(f"No JSON found in response (len={len(text)}), using defaults")
-                return defaults
-
-            result = json.loads(json_str)
-            # Merge with defaults for any missing keys
-            for key, value in defaults.items():
-                if key not in result:
-                    result[key] = value
-            return result
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"JSON parse failed: {e}, response preview: {text[:200] if text else 'empty'}")
-            return defaults
 
     def _save_checkpoint(self, state: InvestigationState, iteration: int):
         """Save investigation checkpoint."""
         if not self.config.checkpoint_dir:
             return
 
-        checkpoint_path = Path(self.config.checkpoint_dir) / f"checkpoint_{state.id}_iter{iteration}.json"
+        checkpoint_path = Path(self.config.checkpoint_dir) / \
+            f"checkpoint_{state.id}_iter{iteration}.json"
         state.save_checkpoint(checkpoint_path)
         logger.info(f"Saved checkpoint: {checkpoint_path}")
-
-        # Also save latest checkpoint reference
-        latest_path = Path(self.config.checkpoint_dir) / f"latest_{state.id}.json"
-        state.save_checkpoint(latest_path)
 
     async def resume_investigation(
         self,
         checkpoint_path: str | Path,
     ) -> InvestigationState:
-        """
-        Resume investigation from checkpoint.
-
-        Args:
-            checkpoint_path: Path to checkpoint file
-
-        Returns:
-            InvestigationState with completed investigation
-        """
+        """Resume investigation from checkpoint."""
         state = InvestigationState.load_checkpoint(checkpoint_path)
         repo = MatterRepository(state.repository_path)
+        cache = InvestigationCache()
 
-        self._emit_step(state, StepType.THINKING, f"Resuming investigation from checkpoint")
+        self._emit_step(state, StepType.THINKING,
+                        "Resuming investigation from checkpoint")
 
         try:
-            # Continue investigation loop if not complete
             if state.status not in ("completed", "failed"):
-                await self._investigate_loop(state, repo)
-                await self._verify_citations(state, repo)
+                await self._investigate_loop(state, repo, cache)
                 await self._synthesize(state)
                 state.complete()
 
@@ -1674,396 +1258,44 @@ class RLMEngine:
 
         return state
 
-    def _extract_json(self, text: str) -> str:
-        """Extract JSON from LLM response."""
-        # Try to find JSON block with proper closing
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            if end > start:
-                return text[start:end].strip()
-            # No closing ``` - try to extract JSON directly from after ```json
-            remaining = text[start:].strip()
-            if remaining.startswith("{"):
-                return self._extract_raw_json(remaining)
-
-        if "```" in text:
-            start = text.find("```") + 3
-            end = text.find("```", start)
-            if end > start:
-                return text[start:end].strip()
-
-        # Try to find raw JSON
-        return self._extract_raw_json(text)
-
-    def _extract_raw_json(self, text: str) -> str:
-        """Extract raw JSON object from text."""
-        if "{" not in text:
-            return text
-
-        start = text.find("{")
-        # Find matching closing brace
-        depth = 0
-        for i, c in enumerate(text[start:], start):
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start:i+1]
-
-        # If no matching brace found, try to return partial JSON up to end
-        # This handles truncated responses
-        return text[start:]
-
-    async def decompose_query(self, query: str) -> list[dict]:
-        """
-        Decompose a compound query into sub-queries.
-
-        Args:
-            query: The potentially compound legal query
-
-        Returns:
-            List of sub-queries with metadata:
-            [{"query": "...", "priority": 0-1, "depends_on": None or query_id}]
-        """
-        prompt = f"""You are a legal research assistant. Analyze this query and determine if it should be broken into sub-queries.
-
-Query: {query}
-
-If this is a simple query, return it as-is.
-If this is a compound query (multiple questions, comparisons, or multi-part analysis), break it into logical sub-queries.
-
-Consider:
-1. Are there multiple distinct questions?
-2. Is there a comparison between different things?
-3. Are there dependent questions (one must be answered before another)?
-
-Respond in JSON format:
-{{
-    "is_compound": true/false,
-    "sub_queries": [
-        {{"query": "...", "priority": 0.0-1.0, "depends_on": null or index}},
-        ...
-    ],
-    "reasoning": "Why you chose to split or not split"
-}}
-
-If not compound, return the original query as a single sub_query with priority 1.0."""
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "is_compound": False,
-            "sub_queries": [{"query": query, "priority": 1.0, "depends_on": None}],
-            "reasoning": "Single query"
-        }
-
-        result = self._parse_json_safe(response, defaults)
-
-        # Ensure we always have at least the original query
-        if not result.get("sub_queries"):
-            result["sub_queries"] = [{"query": query, "priority": 1.0, "depends_on": None}]
-
-        return result["sub_queries"]
-
-    async def investigate_multi(
-        self,
-        queries: list[str],
-        repository_path: str | Path,
-        parallel: bool = True,
-    ) -> dict[str, InvestigationState]:
-        """
-        Investigate multiple queries against the same repository.
-
-        Args:
-            queries: List of queries to investigate
-            repository_path: Path to document repository
-            parallel: If True, run investigations in parallel
-
-        Returns:
-            Dict mapping query to InvestigationState
-        """
-        if parallel:
-            # Run all investigations in parallel
-            tasks = [
-                self.investigate(query, repository_path)
-                for query in queries
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            return {
-                query: result if not isinstance(result, Exception) else self._create_failed_state(query, str(result), repository_path)
-                for query, result in zip(queries, results)
-            }
-        else:
-            # Run sequentially
-            results = {}
-            for query in queries:
-                try:
-                    results[query] = await self.investigate(query, repository_path)
-                except Exception as e:
-                    results[query] = self._create_failed_state(query, str(e), repository_path)
-            return results
-
-    def _create_failed_state(self, query: str, error: str, repository_path: str | Path) -> InvestigationState:
-        """Create a failed investigation state."""
-        state = InvestigationState.create(query, str(repository_path))
-        state.fail(error)
-        return state
-
-    async def investigate_compound(
-        self,
-        query: str,
-        repository_path: str | Path,
-    ) -> dict[str, Any]:
-        """
-        Investigate a potentially compound query.
-
-        This method:
-        1. Decomposes the query if compound
-        2. Runs sub-investigations
-        3. Merges results into a unified response
-
-        Args:
-            query: The legal query (may be compound)
-            repository_path: Path to document repository
-
-        Returns:
-            Dict with merged results and individual states
-        """
-        # Decompose query
-        sub_queries = await self.decompose_query(query)
-
-        # Separate independent and dependent queries
-        independent = [sq for sq in sub_queries if sq.get("depends_on") is None]
-        dependent = [sq for sq in sub_queries if sq.get("depends_on") is not None]
-
-        # Run independent queries in parallel
-        independent_queries = [sq["query"] for sq in independent]
-        results = await self.investigate_multi(independent_queries, repository_path, parallel=True)
-
-        # Run dependent queries sequentially with context
-        for dep_query in dependent:
-            dep_on = dep_query.get("depends_on")
-            if dep_on is not None and dep_on < len(independent_queries):
-                # Add context from dependency
-                parent_query = independent_queries[dep_on]
-                parent_state = results.get(parent_query)
-                if parent_state and parent_state.status == "completed":
-                    # Enrich query with parent findings
-                    enriched_query = f"{dep_query['query']}\n\nContext from previous analysis:\n{parent_state.hypothesis or ''}"
-                    results[dep_query["query"]] = await self.investigate(enriched_query, repository_path)
-                else:
-                    results[dep_query["query"]] = await self.investigate(dep_query["query"], repository_path)
-            else:
-                results[dep_query["query"]] = await self.investigate(dep_query["query"], repository_path)
-
-        # Merge results
-        merged = self._merge_investigation_results(query, results)
-
-        return {
-            "original_query": query,
-            "sub_queries": [sq["query"] for sq in sub_queries],
-            "individual_results": results,
-            "merged": merged,
-        }
-
-    def _merge_investigation_results(
-        self,
-        original_query: str,
-        results: dict[str, InvestigationState],
-    ) -> dict[str, Any]:
-        """Merge results from multiple investigations."""
-        merged = {
-            "total_documents_read": 0,
-            "total_citations": 0,
-            "all_citations": [],
-            "all_entities": {},
-            "all_facts": [],
-            "all_hypotheses": [],
-            "combined_confidence": 0,
-        }
-
-        for query, state in results.items():
-            if state.status != "completed":
-                continue
-
-            merged["total_documents_read"] += state.documents_read
-            merged["total_citations"] += len(state.citations)
-            merged["all_citations"].extend(state.citations)
-
-            # Merge entities
-            for key, entity in state.entities.items():
-                if key in merged["all_entities"]:
-                    merged["all_entities"][key].mentions += entity.mentions
-                    merged["all_entities"][key].sources.extend(entity.sources)
-                else:
-                    merged["all_entities"][key] = entity
-
-            # Collect facts
-            merged["all_facts"].extend(state.findings.get("accumulated_facts", []))
-
-            # Collect hypotheses
-            if state.hypothesis:
-                merged["all_hypotheses"].append({
-                    "query": query,
-                    "hypothesis": state.hypothesis,
-                })
-
-            # Accumulate confidence
-            confidence = state.get_confidence_score()
-            merged["combined_confidence"] += confidence["score"]
-
-        # Average confidence
-        num_completed = sum(1 for s in results.values() if s.status == "completed")
-        if num_completed > 0:
-            merged["combined_confidence"] = merged["combined_confidence"] / num_completed
-
-        # Deduplicate facts
-        seen_facts = set()
-        unique_facts = []
-        for fact in merged["all_facts"]:
-            fact_normalized = " ".join(fact.lower().split())[:100]
-            if fact_normalized not in seen_facts:
-                seen_facts.add(fact_normalized)
-                unique_facts.append(fact)
-        merged["all_facts"] = unique_facts
-
-        return merged
-
-    async def summarize_document(
-        self,
-        file_path: Path,
-        repository: Optional[MatterRepository] = None,
-    ) -> dict[str, Any]:
-        """
-        Create a structured summary of a single document.
-
-        Args:
-            file_path: Path to document
-            repository: Optional repository for reading document
-
-        Returns:
-            Dict with summary information
-        """
-        if repository:
-            doc = repository.read(str(file_path))
-        else:
-            from ..core.repository import MatterRepository
-            temp_repo = MatterRepository(file_path.parent)
-            doc = temp_repo.read(str(file_path))
-
-        # Determine document type from filename
-        filename_lower = file_path.name.lower()
-        doc_type = "other"
-        type_keywords = {
-            "contract": "contract",
-            "agreement": "contract",
-            "complaint": "pleading",
-            "motion": "pleading",
-            "letter": "correspondence",
-            "email": "correspondence",
-            "memo": "correspondence",
-        }
-        for keyword, dtype in type_keywords.items():
-            if keyword in filename_lower:
-                doc_type = dtype
-                break
-
-        # Truncate content for prompt
-        content = doc.full_text[:self.config.excerpt_chars]
-
-        prompt = SUMMARIZE_DOCUMENT_PROMPT.format(
-            filename=file_path.name,
-            doc_type=doc_type,
-            content=content,
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "summary": "Unable to generate summary",
-            "document_type": doc_type,
-            "parties": [],
-            "key_dates": [],
-            "key_terms": [],
-            "amounts": [],
-            "concerns": [],
-        }
-
-        result = self._parse_json_safe(response, defaults)
-        result["filename"] = file_path.name
-        result["file_path"] = str(file_path)
-
-        return result
-
     async def summarize_documents(
         self,
         file_paths: list[Path],
         repository: Optional[MatterRepository] = None,
     ) -> dict[str, Any]:
-        """
-        Create summaries for multiple documents and a collection summary.
+        """Create summaries for multiple documents."""
+        if not file_paths:
+            return {"individual_summaries": [], "collection_summary": None}
 
-        Args:
-            file_paths: List of document paths
-            repository: Optional repository
+        summaries = []
+        for fp in file_paths:
+            try:
+                if repository:
+                    doc = repository.read(str(fp))
+                else:
+                    temp_repo = MatterRepository(fp.parent)
+                    doc = temp_repo.read(str(fp))
 
-        Returns:
-            Dict with individual and collection summaries
-        """
-        # Generate individual summaries in parallel
-        tasks = [
-            self.summarize_document(fp, repository)
-            for fp in file_paths
-        ]
-        individual_summaries = await asyncio.gather(*tasks, return_exceptions=True)
+                content = doc.get_excerpt(self.config.excerpt_chars_complex)
 
-        # Filter out failures
-        valid_summaries = [
-            s for s in individual_summaries
-            if not isinstance(s, Exception)
-        ]
+                extraction = await decisions.extract_facts(
+                    query="Summarize this document",
+                    filename=doc.filename,
+                    content=content,
+                    client=self.client,
+                )
 
-        if not valid_summaries:
-            return {
-                "individual_summaries": [],
-                "collection_summary": None,
-                "error": "No documents could be summarized",
-            }
+                summaries.append({
+                    "filename": doc.filename,
+                    "facts": extraction.get("facts", []),
+                    "quotes": extraction.get("quotes", []),
+                    "references": extraction.get("references", []),
+                })
 
-        # Generate collection summary
-        document_list = "\n".join(
-            f"- {s['filename']}: {s.get('document_type', 'unknown')}"
-            for s in valid_summaries
-        )
-
-        summaries_text = "\n\n".join(
-            f"### {s['filename']}\n{s.get('summary', 'No summary')}"
-            for s in valid_summaries
-        )
-
-        prompt = SUMMARIZE_COLLECTION_PROMPT.format(
-            document_list=document_list,
-            summaries=summaries_text,
-        )
-
-        response = await self.client.complete(prompt, tier=ModelTier.FLASH)
-
-        defaults = {
-            "collection_summary": "Unable to generate collection summary",
-            "parties": [],
-            "timeline": [],
-            "themes": [],
-            "document_relationships": [],
-            "gaps": [],
-        }
-
-        collection_summary = self._parse_json_safe(response, defaults)
+            except Exception as e:
+                logger.error(f"Failed to summarize {fp}: {e}")
 
         return {
-            "individual_summaries": valid_summaries,
-            "collection_summary": collection_summary,
-            "document_count": len(valid_summaries),
+            "individual_summaries": summaries,
+            "document_count": len(summaries),
         }
