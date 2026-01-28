@@ -464,7 +464,7 @@ Query: {state.query}
         priority_files = plan.get("priority_files", [])
         for filepath in priority_files[:3]:  # Limit to top 3 priority files
             if isinstance(filepath, str):
-                state.add_lead(f"Read document: {filepath}", source="initial_plan", priority=0.95)
+                state.add_lead(f"Read document: {filepath}", source="initial_plan")
 
         # Then create leads from search terms
         for term in plan.get("search_terms", [])[:3]:
