@@ -117,13 +117,14 @@ def create_app(config: Optional[ServiceConfig] = None) -> FastAPI:
     # Store config in app state
     app.state.config = config
 
-    # Mount Gradio UI at /ui path (root path would override API routes)
+    # Mount Gradio Chat UI at /ui path (root path would override API routes)
+    # Use the chat UI for consistent experience across local and S3 modes
     try:
         import gradio as gr
-        from ..ui.app import create_app as create_gradio_app
-        gradio_app = create_gradio_app(api_key=config.gemini_api_key)
+        from ..ui.chat_app import create_chat_app
+        gradio_app = create_chat_app(api_key=config.gemini_api_key)
         app = gr.mount_gradio_app(app, gradio_app, path="/ui")
-        logger.info("Gradio UI mounted at /ui")
+        logger.info("Gradio Chat UI mounted at /ui")
     except ImportError as e:
         logger.warning(f"Gradio not available, UI disabled: {e}")
     except Exception as e:
@@ -441,9 +442,12 @@ async def _save_uploaded_files(
 )
 async def upload_investigate(
     query: str = Form(..., description="Investigation query"),
-    files: list[UploadFile] = File(..., description="Document files to analyze"),
-    callback_url: Optional[str] = Form(None, description="Webhook URL for results"),
-    keep_files: bool = Form(False, description="Keep files in S3 after processing"),
+    files: list[UploadFile] = File(...,
+                                   description="Document files to analyze"),
+    callback_url: Optional[str] = Form(
+        None, description="Webhook URL for results"),
+    keep_files: bool = Form(
+        False, description="Keep files in S3 after processing"),
     background_tasks: BackgroundTasks = None,
 ):
     """Start investigation with uploaded files (async).
@@ -487,7 +491,8 @@ async def upload_investigate(
             file_data.append((filename, content))
 
         if not file_data:
-            raise HTTPException(status_code=400, detail="No valid files uploaded")
+            raise HTTPException(
+                status_code=400, detail="No valid files uploaded")
 
         # Branch based on storage mode
         if config.storage_mode == "local":
@@ -588,7 +593,8 @@ async def _run_upload_investigation(
             job.completed_at - job.created_at
         ).total_seconds()
 
-        logger.info(f"Upload job {job_id} completed in {job.duration_seconds:.1f}s (mode={'local' if is_local else 's3'})")
+        logger.info(
+            f"Upload job {job_id} completed in {job.duration_seconds:.1f}s (mode={'local' if is_local else 's3'})")
 
         # Call webhook if provided
         if callback_url:
@@ -619,7 +625,8 @@ async def _run_upload_investigation(
                     )
                     await cleanup_repo.delete_prefix(s3_prefix)
                 except Exception as e:
-                    logger.warning(f"Failed to cleanup S3 prefix {s3_prefix}: {e}")
+                    logger.warning(
+                        f"Failed to cleanup S3 prefix {s3_prefix}: {e}")
 
 
 @app.post(
@@ -629,7 +636,8 @@ async def _run_upload_investigation(
 )
 async def upload_search(
     query: str = Form(..., description="Search query"),
-    files: list[UploadFile] = File(..., description="Document files to search"),
+    files: list[UploadFile] = File(...,
+                                   description="Document files to search"),
     max_results: int = Form(20, ge=1, le=100, description="Maximum results"),
 ):
     """Quick search across uploaded files.
@@ -654,7 +662,8 @@ async def upload_search(
             file_data.append((filename, content))
 
         if not file_data:
-            raise HTTPException(status_code=400, detail="No valid files uploaded")
+            raise HTTPException(
+                status_code=400, detail="No valid files uploaded")
 
         # Branch based on storage mode
         if config.storage_mode == "local":
@@ -727,8 +736,10 @@ async def upload_search(
 )
 async def upload_investigate_sync(
     query: str = Form(..., description="Investigation query"),
-    files: list[UploadFile] = File(..., description="Document files to analyze"),
-    keep_files: bool = Form(False, description="Keep files in S3 after processing for re-query"),
+    files: list[UploadFile] = File(...,
+                                   description="Document files to analyze"),
+    keep_files: bool = Form(
+        False, description="Keep files in S3 after processing for re-query"),
 ):
     """Upload and investigate files synchronously.
 
@@ -765,7 +776,8 @@ async def upload_investigate_sync(
             file_data.append((filename, content))
 
         if not file_data:
-            raise HTTPException(status_code=400, detail="No valid files uploaded")
+            raise HTTPException(
+                status_code=400, detail="No valid files uploaded")
 
         # Branch based on storage mode
         if config.storage_mode == "local":
@@ -812,7 +824,8 @@ async def upload_investigate_sync(
                 await s3_repo.delete_prefix(s3_prefix)
 
         duration = time.time() - start_time
-        logger.info(f"Sync investigation {job_id} completed in {duration:.1f}s (mode={config.storage_mode})")
+        logger.info(
+            f"Sync investigation {job_id} completed in {duration:.1f}s (mode={config.storage_mode})")
 
         citations, entities = _serialize_result(result)
         response = SyncInvestigateResponse(
@@ -949,7 +962,8 @@ async def _run_urls_investigation(
             job.completed_at - job.created_at
         ).total_seconds()
 
-        logger.info(f"URLs job {job_id} completed in {job.duration_seconds:.1f}s")
+        logger.info(
+            f"URLs job {job_id} completed in {job.duration_seconds:.1f}s")
 
         # Call webhook if provided
         if request.callback_url:
@@ -1073,7 +1087,8 @@ async def investigate_urls_sync(request: S3UrlsInvestigateRequest):
         await s3_repo.cleanup(job_id)
 
         duration = time.time() - start_time
-        logger.info(f"URL sync investigation {job_id} completed in {duration:.1f}s")
+        logger.info(
+            f"URL sync investigation {job_id} completed in {duration:.1f}s")
 
         citations, entities = _serialize_result(result)
         return SyncInvestigateResponse(
