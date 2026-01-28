@@ -884,24 +884,33 @@ Query: {state.query}
         ranked_docs = analysis.get("ranked_documents", [])
 
         # Filter to unread, non-irrelevant files and extract top ones
+        # Use set to deduplicate and preserve order
         top_files = []
+        seen_files = set()
         for doc in ranked_docs:
             filepath = doc.get("file") if isinstance(doc, dict) else doc
             criticality = doc.get("criticality", "SUPPORTING") if isinstance(doc, dict) else "SUPPORTING"
+
+            # Normalize criticality to uppercase for case-insensitive comparison
+            criticality = criticality.upper() if isinstance(criticality, str) else "SUPPORTING"
 
             # Skip irrelevant documents
             if criticality == "IRRELEVANT":
                 continue
 
-            if filepath and not cache.has_extracted(filepath):
-                top_files.append(filepath)
+            # Skip duplicates and already-extracted files
+            if not filepath or filepath in seen_files or cache.has_extracted(filepath):
+                continue
 
-                # Mark DECISIVE documents for potential pinning
-                if criticality == "DECISIVE":
-                    if "pinned_documents" not in state.findings:
-                        state.findings["pinned_documents"] = []
-                    if filepath not in state.findings["pinned_documents"]:
-                        state.findings["pinned_documents"].append(filepath)
+            seen_files.add(filepath)
+            top_files.append(filepath)
+
+            # Mark DECISIVE documents for potential pinning
+            if criticality == "DECISIVE":
+                if "pinned_documents" not in state.findings:
+                    state.findings["pinned_documents"] = []
+                if filepath not in state.findings["pinned_documents"]:
+                    state.findings["pinned_documents"].append(filepath)
 
         await self._batch_read(state, repo, top_files[:self.config.parallel_reads], cache)
 
