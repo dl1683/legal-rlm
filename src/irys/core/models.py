@@ -151,7 +151,7 @@ MODEL_CONFIGS: dict[ModelTier, ModelConfig] = {
     ),
     ModelTier.FLASH: ModelConfig(
         model_id="gemini-3-flash-preview",  # Primary model
-        thinking_level="medium",
+        thinking_level="",  # Gemini 3.0 doesn't use thinking levels
         temperature=0.0,
         max_output_tokens=32768,
         cost_per_1m_input=0.50,
