@@ -43,8 +43,11 @@ class RLMConfig:
     use_flash_for_simple: bool = True
     # External search settings
     enable_external_search: bool = True
-    max_case_law_results: int = 5
-    max_web_results: int = 5
+    max_case_law_results: int = 5  # Results per query
+    max_web_results: int = 5       # Results per query
+    max_case_law_queries: int = 5  # Max queries to run
+    max_web_queries: int = 5       # Max queries to run
+    parallel_external_searches: bool = True  # Run queries in parallel
 
 
 @dataclass
@@ -456,8 +459,13 @@ Query: {state.query}
             details=plan,
         )
 
-    async def _execute_external_searches(self, state: InvestigationState):
-        """Execute external searches (case law, web) ONLY when the LLM plan requests them.
+    async def _execute_external_searches(
+        self,
+        state: InvestigationState,
+        case_law_queries: list[str] = None,
+        web_queries: list[str] = None,
+    ):
+        """Execute external searches (case law, web) with parallel query support.
 
         This mimics how a real lawyer works:
         1. First, read the repository documents
@@ -466,18 +474,20 @@ Query: {state.query}
 
         External searches are TOOLS, not mandatory steps:
         - Case law: Use when legal precedent questions arise from the documents
-        - Web search: Use when regulations/standards need verification (e.g., state law, industry norms)
+        - Web search: Use when regulations/standards need verification
 
-        The LLM plan decides what external searches are needed based on:
-        - The nature of the query
-        - What's likely in the repository
-        - What gaps might need external verification
+        Supports:
+        - Configurable query limits (max_case_law_queries, max_web_queries)
+        - Parallel execution (parallel_external_searches=True)
+        - Tiered/iterative queries (can be called multiple times with new queries)
         """
-        plan = state.findings.get("initial_plan", {})
-        case_law_queries = plan.get("case_law_searches", [])
-        web_queries = plan.get("web_searches", [])
+        # Get queries from plan if not provided directly
+        if case_law_queries is None and web_queries is None:
+            plan = state.findings.get("initial_plan", {})
+            case_law_queries = plan.get("case_law_searches", [])
+            web_queries = plan.get("web_searches", [])
 
-        # Only proceed if the LLM identified external searches as needed
+        # Only proceed if we have queries
         if not case_law_queries and not web_queries:
             self._emit_step(
                 state,
@@ -486,47 +496,102 @@ Query: {state.query}
             )
             return
 
-        self._external_research = {"case_law": [], "web": [], "analysis": {}}
+        # Initialize or extend external research storage
+        if not hasattr(self, '_external_research') or self._external_research is None:
+            self._external_research = {"case_law": [], "web": [], "analysis": {}}
 
-        # Execute case law searches
-        if case_law_queries and self.external_search:
-            self._emit_step(
-                state,
-                StepType.THINKING,
-                f"Searching case law for: {', '.join(case_law_queries[:2])}...",
-            )
+        # Apply configurable limits
+        case_law_queries = case_law_queries[:self.config.max_case_law_queries] if case_law_queries else []
+        web_queries = web_queries[:self.config.max_web_queries] if web_queries else []
 
-            for query in case_law_queries[:2]:  # Limit to 2 case law searches
-                try:
-                    cases = await self.external_search.search_case_law(
-                        query,
-                        max_results=self.config.max_case_law_results
-                    )
+        total_queries = len(case_law_queries) + len(web_queries)
+        self._emit_step(
+            state,
+            StepType.THINKING,
+            f"Running {total_queries} external search{'es' if total_queries > 1 else ''} "
+            f"({len(case_law_queries)} case law, {len(web_queries)} web)...",
+        )
+
+        # Helper for case law search
+        async def search_case_law(query: str) -> tuple[str, list]:
+            try:
+                cases = await self.external_search.search_case_law(
+                    query,
+                    max_results=self.config.max_case_law_results
+                )
+                return query, cases or []
+            except Exception as e:
+                logger.warning(f"Case law search failed for '{query}': {e}")
+                return query, []
+
+        # Helper for web search
+        async def search_web(query: str) -> tuple[str, dict]:
+            try:
+                result_data = await self.external_search.search_web(
+                    query,
+                    max_results=self.config.max_web_results
+                )
+                return query, result_data or {}
+            except Exception as e:
+                logger.warning(f"Web search failed for '{query}': {e}")
+                return query, {}
+
+        # Execute searches (parallel or sequential)
+        if self.config.parallel_external_searches and self.external_search:
+            # Parallel execution with asyncio.gather
+            tasks = []
+            if case_law_queries:
+                tasks.extend([search_case_law(q) for q in case_law_queries])
+            if web_queries:
+                tasks.extend([search_web(q) for q in web_queries])
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            case_law_count = len(case_law_queries)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.warning(f"External search task failed: {result}")
+                    continue
+
+                query, data = result
+                if i < case_law_count:
+                    # Case law result
+                    if data:
+                        self._external_research["case_law"].extend(data)
+                        self._emit_step(
+                            state,
+                            StepType.FINDING,
+                            f"Found {len(data)} cases for '{query[:30]}...'",
+                        )
+                else:
+                    # Web result
+                    web_results = data.get("results", [])
+                    if web_results:
+                        self._external_research["web"].extend(web_results)
+                        self._emit_step(
+                            state,
+                            StepType.FINDING,
+                            f"Found {len(web_results)} web results for '{query[:30]}...'",
+                        )
+                    if data.get("answer"):
+                        self._external_research["web_answer"] = data["answer"]
+        else:
+            # Sequential execution (fallback)
+            if case_law_queries and self.external_search:
+                for query in case_law_queries:
+                    _, cases = await search_case_law(query)
                     if cases:
                         self._external_research["case_law"].extend(cases)
                         self._emit_step(
                             state,
                             StepType.FINDING,
-                            f"Found {len(cases)} relevant cases for '{query[:30]}...'",
+                            f"Found {len(cases)} cases for '{query[:30]}...'",
                         )
-                except Exception as e:
-                    logger.warning(f"Case law search failed for '{query}': {e}")
 
-        # Execute web searches
-        if web_queries and self.external_search:
-            self._emit_step(
-                state,
-                StepType.THINKING,
-                f"Searching web for regulations/standards: {', '.join(web_queries[:2])}...",
-            )
-
-            for query in web_queries[:2]:  # Limit to 2 web searches
-                try:
-                    result_data = await self.external_search.search_web(
-                        query,
-                        max_results=self.config.max_web_results
-                    )
-                    # search_web returns dict with 'results' key
+            if web_queries and self.external_search:
+                for query in web_queries:
+                    _, result_data = await search_web(query)
                     web_results = result_data.get("results", [])
                     if web_results:
                         self._external_research["web"].extend(web_results)
@@ -535,11 +600,8 @@ Query: {state.query}
                             StepType.FINDING,
                             f"Found {len(web_results)} web results for '{query[:30]}...'",
                         )
-                    # Also capture the AI-generated answer if available
                     if result_data.get("answer"):
                         self._external_research["web_answer"] = result_data["answer"]
-                except Exception as e:
-                    logger.warning(f"Web search failed for '{query}': {e}")
 
         # CONSOLIDATED: Analyze all external results in one call
         if self._external_research.get("case_law") or self._external_research.get("web"):
@@ -626,7 +688,7 @@ Query: {state.query}
         4. Stop when we have sufficient evidence
         """
         iteration = 0
-        external_search_triggered = False  # Track if we've done external search
+        executed_external_queries = set()  # Track executed queries for tiered search
 
         while iteration < self.config.max_iterations:
             state.recursion_depth = iteration + 1
@@ -702,40 +764,64 @@ Query: {state.query}
 
             # 3. Dynamic external search - trigger if we discover we need it
             # (e.g., found references to case law, regulations, state-specific rules)
-            if not external_search_triggered and self.config.enable_external_search and self.external_search:
+            # Supports tiered queries - can run multiple iterations with new queries
+            if self.config.enable_external_search and self.external_search:
                 # Check if findings suggest we need external research
-                needs_external = await self._check_if_external_needed(state)
-                if needs_external:
-                    self._emit_step(
-                        state,
-                        StepType.THINKING,
-                        "Findings suggest external legal research would help...",
-                    )
-                    await self._execute_external_searches(state)
-                    external_search_triggered = True
+                new_queries = await self._check_if_external_needed(state, executed_external_queries)
+                if new_queries:
+                    new_case_law = new_queries.get("case_law_queries", [])
+                    new_web = new_queries.get("web_queries", [])
+                    total_new = len(new_case_law) + len(new_web)
+
+                    if total_new > 0:
+                        self._emit_step(
+                            state,
+                            StepType.THINKING,
+                            f"Running {total_new} new external search{'es' if total_new > 1 else ''}...",
+                        )
+                        await self._execute_external_searches(
+                            state,
+                            case_law_queries=new_case_law,
+                            web_queries=new_web,
+                        )
+                        # Track executed queries
+                        executed_external_queries.update(new_case_law)
+                        executed_external_queries.update(new_web)
 
             # Save checkpoint periodically
             if self.config.checkpoint_dir and iteration % self.config.checkpoint_interval == 0:
                 self._save_checkpoint(state, iteration)
 
-    async def _check_if_external_needed(self, state: InvestigationState) -> bool:
+    async def _check_if_external_needed(
+        self,
+        state: InvestigationState,
+        executed_queries: set[str] = None,
+    ) -> dict | None:
         """Check if accumulated triggers suggest we need external legal research.
 
         Uses trigger-based approach:
         1. Check if meaningful triggers have been accumulated from documents
         2. If yes, use LITE to generate specific queries using those triggers
-        3. If no triggers, skip external search entirely (zero LLM cost)
+        3. Filter out already-executed queries for tiered search support
+        4. If no new queries, return None
 
-        Returns True if queries were generated, False otherwise.
+        Args:
+            state: Current investigation state
+            executed_queries: Set of already-executed query strings to skip
+
+        Returns:
+            Dict with case_law_queries and web_queries, or None if no new queries needed.
         """
+        executed_queries = executed_queries or set()
+
         # Must have read some documents first
         if state.documents_read < 2:
-            return False
+            return None
 
         # Check if we have meaningful triggers from document analysis
         if not state.has_external_triggers(min_triggers=2):
             # No triggers accumulated - skip external search entirely
-            return False
+            return None
 
         facts = state.findings.get("accumulated_facts", [])
         entities = [e.name for e in state.entities.values()][:10] if state.entities else []
@@ -759,21 +845,30 @@ Query: {state.query}
         case_law_queries = result.get("case_law_queries", [])
         web_queries = result.get("web_queries", [])
 
-        # If any queries were generated, store them for execution
-        if case_law_queries or web_queries:
+        # Filter out already-executed queries (for tiered search support)
+        new_case_law = [q for q in case_law_queries if q not in executed_queries]
+        new_web = [q for q in web_queries if q not in executed_queries]
+
+        # If any NEW queries were generated, return them
+        if new_case_law or new_web:
+            # Also store in plan for reference
             if "initial_plan" not in state.findings:
                 state.findings["initial_plan"] = {}
-            state.findings["initial_plan"]["case_law_searches"] = case_law_queries
-            state.findings["initial_plan"]["web_searches"] = web_queries
+
+            # Accumulate queries (don't replace)
+            existing_case_law = state.findings["initial_plan"].get("case_law_searches", [])
+            existing_web = state.findings["initial_plan"].get("web_searches", [])
+            state.findings["initial_plan"]["case_law_searches"] = list(set(existing_case_law + case_law_queries))
+            state.findings["initial_plan"]["web_searches"] = list(set(existing_web + web_queries))
 
             self._emit_step(
                 state,
                 StepType.THINKING,
-                f"Generated {len(case_law_queries)} case law + {len(web_queries)} web queries from triggers",
+                f"Generated {len(new_case_law)} new case law + {len(new_web)} new web queries",
             )
-            return True
+            return {"case_law_queries": new_case_law, "web_queries": new_web}
 
-        return False
+        return None
 
     async def _investigate_lead(
         self,
