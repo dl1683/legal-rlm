@@ -176,7 +176,7 @@ class RLMEngine:
         try:
             # Check if small repository - can skip complex RLM search
             if repo.is_small_repo:
-                file_names = [Path(f).name for f in repo.list_files()[:5]]
+                file_names = [f.filename for f in repo.list_files()[:5]]
                 self._emit_step(
                     state,
                     StepType.THINKING,
@@ -233,7 +233,7 @@ class RLMEngine:
         2. Extract triggers and do external research (with iteration)
         3. Use same _synthesize() as large repos for consistency
         """
-        file_names = [Path(f).name for f in repo.list_files()]
+        file_names = [f.filename for f in repo.list_files()]
         self._emit_step(state, StepType.READING, f"Loading: {_fmt_list(file_names, 4, 25)}")
 
         # Load all content directly - no complex search needed for small repos
