@@ -98,7 +98,8 @@ Create security group `irys-api-sg`:
 | Type | Port | Source | Description |
 |------|------|--------|-------------|
 | SSH | 22 | Your IP | SSH access |
-| Custom TCP | 8000 | Chat service IP/VPC | API access |
+| HTTP | 80 | 0.0.0.0/0 | Redirect to HTTPS |
+| HTTPS | 443 | 0.0.0.0/0 | API access (SSL) |
 
 ---
 
@@ -168,7 +169,7 @@ curl http://localhost:8000/health
 ### Step 4: Configure Security Group
 
 Allow inbound traffic:
-- **Port 8000** (or 80/443 with ALB) from your chat service IP
+- **Port 80** from your chat service IP (nginx reverse proxy)
 - **Port 22** for SSH (your IP only)
 
 ## API Usage
@@ -178,7 +179,7 @@ Allow inbound traffic:
 ```python
 import httpx
 
-IRYS_API = "http://your-ec2-ip:8000"
+IRYS_API = "http://your-ec2-elastic-ip"  # No port needed with nginx
 
 # Start investigation
 async def investigate_documents(query: str, s3_prefix: str):
@@ -216,7 +217,7 @@ async def get_results(job_id: str):
 ### Example: Start Investigation
 
 ```bash
-curl -X POST http://localhost:8000/investigate \
+curl -X POST http://your-elastic-ip/investigate \
   -H "Content-Type: application/json" \
   -d '{
     "query": "What are the payment terms?",
@@ -237,7 +238,7 @@ Response:
 ### Example: Get Results
 
 ```bash
-curl http://localhost:8000/investigate/inv_abc123def456
+curl http://your-elastic-ip/investigate/inv_abc123def456
 ```
 
 Response (when complete):
@@ -487,6 +488,53 @@ docker-compose logs -f
 | 5 | Test health endpoint |
 | 6 | Configure chat service to call API |
 
-**Your API will be at:** `http://your-ec2-ip:8000`
+**Your API will be at:** `https://rlm.irys.ai`
 
-**Interactive docs at:** `http://your-ec2-ip:8000/docs`
+**Interactive docs at:** `https://rlm.irys.ai/docs`
+
+---
+
+## HTTPS Setup (Let's Encrypt)
+
+### Prerequisites
+- Domain pointing to your Elastic IP (A record)
+- Ports 80 and 443 open in security group
+
+### Step 1: Get SSL Certificate
+
+```bash
+cd /home/ubuntu/legal-rlm
+
+# Edit init-ssl.sh to set your email
+nano init-ssl.sh  # Change EMAIL="admin@irys.ai" to your email
+
+# Run the SSL initialization script
+./init-ssl.sh
+```
+
+### Step 2: Start Services
+
+```bash
+# Create .env file if not already done
+cat > .env << 'EOF'
+GEMINI_API_KEY=your_gemini_key
+S3_BUCKET=your-bucket-name
+S3_REGION=us-east-1
+EOF
+
+# Start all services
+docker-compose up -d --build
+
+# Verify
+curl https://rlm.irys.ai/health
+```
+
+### Certificate Auto-Renewal
+
+Certificates auto-renew via the certbot container. It checks every 12 hours and renews if expiring within 30 days.
+
+To manually renew:
+```bash
+docker-compose run --rm certbot renew
+docker-compose exec nginx nginx -s reload
+```
