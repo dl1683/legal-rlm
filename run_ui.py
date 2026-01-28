@@ -21,8 +21,8 @@ except ImportError:
     print("[WARN] python-dotenv not installed. Install with: pip install python-dotenv")
     print("   Falling back to system environment variables...")
 
-# Now import after env is loaded
-from irys.ui.app import create_app, get_storage_mode
+# Now import after env is loaded - use multi-turn chat UI with stop button
+from irys.ui.chat_app import create_chat_app
 
 
 def parse_args():
@@ -102,17 +102,8 @@ if __name__ == "__main__":
 
     print(f"[OK] API key loaded: {api_key[:20]}...")
 
-    # Show storage mode
-    storage_mode = get_storage_mode()
-    print(f"[INFO] Storage mode: {storage_mode}")
-    if storage_mode != "local":
-        s3_bucket = os.environ.get("S3_BUCKET", "")
-        if not s3_bucket:
-            print("[WARN] S3_BUCKET not set - file uploads will fail!")
-        else:
-            print(f"[OK] S3 bucket: {s3_bucket}")
-
-    app = create_app(api_key=api_key)
+    # Create multi-turn chat app with stop button
+    app = create_chat_app(api_key=api_key)
 
     # Build launch kwargs
     launch_kwargs = {
@@ -139,10 +130,7 @@ if __name__ == "__main__":
     if args.root_path:
         url += args.root_path
 
-    print(f"\n[START] Launching Irys RLM UI on {url}")
-    if storage_mode == "local":
-        print("[MODE] Local mode - using folder browser")
-    else:
-        print("[MODE] Cloud mode - using file upload (files stored in S3)")
+    print(f"\n[START] Launching Irys RLM Multi-Turn Chat UI on {url}")
+    print("[MODE] Local mode - multi-turn chat with stop button")
 
     app.launch(**launch_kwargs)
