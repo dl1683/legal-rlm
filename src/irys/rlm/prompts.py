@@ -501,41 +501,72 @@ Research triggers identified from documents:
 
 Based on the facts AND the research triggers, generate SPECIFIC external search queries.
 
-HOW TO USE TRIGGERS:
-- If jurisdictions found (e.g., "Michigan") → search that jurisdiction's case law
-- If regulations found (e.g., "FAA Part 91") → search for that specific regulation
-- If legal doctrines found (e.g., "breach of warranty") → search for precedent on that doctrine
-- If industry standards found → search for those specific standards
-- If case references found → search for those specific cases
+=== WHEN TO USE EACH SOURCE ===
 
-RULES:
-- PRIORITIZE triggers - they tell you exactly what to search for
-- Combine triggers with entities for specific queries (e.g., "Michigan breach of warranty aircraft")
-- Only generate queries if triggers or facts suggest external research would help
-- Return EMPTY lists if no meaningful triggers exist and facts are sufficient
+CASE LAW (CourtListener) - Use when:
+- Query involves US legal precedent, judicial interpretations, or standards of proof
+- US jurisdictions are mentioned (e.g., "Michigan", "Delaware", federal courts)
+- Legal doctrines need authority (breach of warranty, negligence, fiduciary duty, etc.)
+- Need to support legal arguments with US case citations
+- LIMITATION: CourtListener is US-focused. DO NOT use for international matters.
 
-GOOD examples (using triggers + entities):
-- "Michigan breach of warranty aircraft maintenance" (jurisdiction + doctrine + industry)
-- "FAA Part 91 inspection requirements G550" (regulation + specific aircraft)
-- "Gulfstream negligent misrepresentation damages" (entity + doctrine)
+WEB SEARCH (Tavily) - Use when:
+- Query asks about regulations, statutes, or industry standards
+- User provides a URL/link to look up
+- Need to verify regulatory compliance requirements
+- Triggers include specific regulations (FAA, SEC, OSHA, state codes)
+- International matters - use web for non-US jurisdictions
+- Company/entity research (background, public records, news)
 
-BAD examples (DO NOT USE):
-- "breach of contract cases" (too generic)
-- "aviation regulations" (too generic)
-- "damages case law" (too generic)
+RETURN EMPTY ARRAYS when:
+- That source type is not relevant to this specific query
+- Local documents already have sufficient information
+- No meaningful triggers for that source type
+- The query asks only about case-specific facts (no external authority needed)
+
+=== HOW TO USE TRIGGERS ===
+- If US jurisdictions found (e.g., "Michigan") → case_law_queries
+- If international jurisdictions found → web_queries (NOT case law)
+- If regulations/statutes found (e.g., "FAA Part 91") → web_queries
+- If US legal doctrines found → case_law_queries
+- If industry standards found → web_queries
+- If specific case references found → case_law_queries (to find those cases)
+
+=== EXAMPLES ===
+
+Query about US case law:
+  case_law_queries: ["Michigan breach of warranty aircraft maintenance"]
+  web_queries: []
+
+Query about regulations:
+  case_law_queries: []
+  web_queries: ["FAA Part 91 inspection requirements"]
+
+Query about international matter (e.g., UK, EU):
+  case_law_queries: []
+  web_queries: ["UK aviation maintenance regulations", "EASA inspection standards"]
+
+Query needing both (US legal + regulatory):
+  case_law_queries: ["Delaware fiduciary duty directors"]
+  web_queries: ["SEC disclosure requirements public companies"]
+
+Query about case facts only:
+  case_law_queries: []
+  web_queries: []
+  reasoning: "Query asks only about facts in documents, no external authority needed"
 
 Reply in JSON only:
 {{
     "case_law_queries": ["specific query 1", "specific query 2"],
-    "web_queries": ["specific regulation query"],
-    "reasoning": "Brief explanation of which triggers informed these searches"
+    "web_queries": ["specific regulation/standard query"],
+    "reasoning": "Brief explanation of source selection and which triggers informed searches"
 }}
 
-If no external research is needed (no meaningful triggers, facts sufficient), reply:
+If no external research is needed, reply:
 {{
     "case_law_queries": [],
     "web_queries": [],
-    "reasoning": "No meaningful triggers found; facts are sufficient"
+    "reasoning": "Reason why external research not needed"
 }}"""
 
 
