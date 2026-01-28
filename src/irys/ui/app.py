@@ -69,6 +69,7 @@ class RLMApp:
         self.citations_log: list[str] = []
         self.update_queue: queue.Queue = queue.Queue()
         self.is_running = False
+        self.stop_requested = False  # Flag to stop investigation midway
         self.final_output = ""
         self.error_msg = ""
         self._temp_dirs: dict[str, Path] = {}  # Track temp dirs for cleanup
@@ -161,6 +162,14 @@ class RLMApp:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir)
                 logger.info(f"Cleaned up temp directory: {temp_dir}")
+
+    def stop_investigation(self) -> str:
+        """Stop the current investigation."""
+        if self.is_running:
+            self.stop_requested = True
+            self.update_queue.put(("stopped", "Investigation stopped by user"))
+            return "Stopping..."
+        return "No investigation running"
 
     def on_thinking_step(self, step: ThinkingStep):
         """Callback for thinking steps - pushes to queue for real-time updates."""
@@ -324,6 +333,7 @@ class RLMApp:
         self.final_output = ""
         self.error_msg = ""
         self.update_queue = queue.Queue()
+        self.stop_requested = False  # Reset stop flag
 
         # Combine files from both upload sources
         all_uploaded = []
@@ -378,6 +388,7 @@ class RLMApp:
         self.final_output = ""
         self.error_msg = ""
         self.update_queue = queue.Queue()
+        self.stop_requested = False  # Reset stop flag
 
         if not repo_path or not Path(repo_path).exists():
             yield ("", "", "", "Error: Please select a valid directory")
@@ -453,6 +464,20 @@ class RLMApp:
                         "\n".join(self.thinking_log),
                         "",
                         f"Error: {data}"
+                    )
+                    return
+
+                elif update_type == "stopped":
+                    self.is_running = False
+                    elapsed = time.time() - start_time
+                    # Show partial findings from thinking log
+                    partial_summary = "\n".join(self.thinking_log[-5:]) if self.thinking_log else "No findings yet"
+                    stop_output = f"*Investigation stopped after {elapsed:.1f}s*\n\nPartial findings:\n{partial_summary}"
+                    yield (
+                        stop_output,
+                        "\n".join(self.thinking_log),
+                        "\n".join(self.citations_log) or "No citations found",
+                        f"Status: STOPPED\nDuration: {elapsed:.1f}s\nSteps completed: {len(self.thinking_log)}"
                     )
                     return
 
@@ -546,7 +571,9 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                     placeholder="What would you like to investigate?",
                     lines=3,
                 )
-                submit_btn = gr.Button("Investigate", variant="primary", size="lg")
+                with gr.Row():
+                    submit_btn = gr.Button("Investigate", variant="primary", size="lg")
+                    stop_btn = gr.Button("Stop", variant="stop", size="lg")
 
             with gr.Column(scale=1):
                 status = gr.Textbox(label="Status", lines=8, interactive=False)
@@ -590,6 +617,12 @@ def create_app(api_key: Optional[str] = None) -> gr.Blocks:
                 inputs=[query, file_upload, folder_upload],
                 outputs=[output, thinking, citations, status],
             )
+
+        # Stop button (works for both modes)
+        stop_btn.click(
+            fn=app.stop_investigation,
+            outputs=[status],
+        )
 
         # Example queries (click to populate query field)
         gr.Markdown("### Example Queries (click to use)")
