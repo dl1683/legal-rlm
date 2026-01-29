@@ -8,32 +8,46 @@ Organized by model tier: WORKER (cheap/fast), MID (balanced), HIGH (expensive/th
 # WORKER TIER PROMPTS (LITE model - quick decisions)
 # =============================================================================
 
-P_PICK_FILES = """Given this query and list of files, which files are most likely to contain relevant information?
+P_PICK_FILES = """Select files most likely to answer this query.
 
 Query: {query}
 
-Files in repository:
+Files:
 {file_list}
 
-Pick the 3-5 most relevant files. Consider:
-- Filename matches query terms
-- Document type (contracts, agreements, reports are usually important)
-- Likely to contain the answer
+Select 3-5 files. Prioritize:
+- Pleadings, briefs, statements (define disputes, contain positions)
+- Contracts, agreements (primary source documents)
+- Correspondence, emails (actual party communications)
+- Expert reports (specialized analysis)
+- Documents with names/terms matching the query
 
-Reply with just the filenames, one per line. No explanations."""
+Deprioritize:
+- Generic reference materials (statutes, manuals, guidelines)
+- Template documents
+
+Reply with filenames only, one per line."""
 
 
-P_PICK_HITS = """Given this query and search results, which results are most relevant?
+P_PICK_HITS = """Select the most relevant search hits for this query.
 
 Query: {query}
 
 Search Results:
 {hits}
 
-Pick the 5-10 most relevant results by their number (e.g., [1], [5], [8]).
-Consider which ones directly answer or relate to the query.
+Select 5-10 hits by number. Prioritize:
+- Direct answers to the query
+- Specific facts, figures, dates relevant to the issue
+- Key contractual provisions or legal conclusions
+- Party admissions or positions
 
-Reply with just the numbers, comma-separated. Example: 1, 3, 5, 8"""
+Deprioritize:
+- Boilerplate language
+- Generic definitions
+- Tangential references
+
+Reply with numbers only, comma-separated. Example: 1, 3, 5, 8"""
 
 
 P_CLASSIFY_QUERY = """Classify this legal query for synthesis complexity.
@@ -104,44 +118,43 @@ DO NOT INCLUDE:
 Reply with just the search terms, one per line. No explanations."""
 
 
-P_PRIORITIZE_DOCUMENTS = """You are ranking candidate documents for relevance to a legal query.
+P_PRIORITIZE_DOCUMENTS = """Rank these documents for relevance to the query.
 
 Query: {query}
 
-Key issues identified:
-{key_issues}
+Key issues: {key_issues}
 
-Candidate files (from search results):
+Candidates:
 {candidate_files}
 
-Already read documents:
-{already_read}
+Already read: {already_read}
 
-Score each candidate from 0-100 for likely relevance to the query and key issues.
+SCORING (0-100):
+- 90-100: Directly answers the query (pleadings, key contracts, party briefs on point)
+- 70-89: Contains key supporting evidence
+- 40-69: Relevant context
+- 10-39: Tangentially related
+- 0-9: Not useful for this query
 
-CRITICAL PRIORITY RULES:
-1. For actual damages/costs/figures: CLAIMANT documents have the real numbers (Claimant briefs, Statements of Claim)
-2. DEFENDANT/RESPONDENT briefs contain arguments but often NOT the actual figures
-3. When BOTH party briefs exist, READ BOTH - they contain different information
+DOCUMENT VALUE HIERARCHY:
+- Opening/Closing statements: Synthesized positions, final figures
+- Party briefs: Claimant briefs have damages; Defendant briefs have defenses
+- Pleadings (complaints, answers): Define the dispute
+- Contracts/agreements: Primary source terms
+- Correspondence: Actual party communications
+- Expert reports: Specialized analysis
+- Reference materials: Low priority unless specifically needed
 
-PRIORITY ORDER (score higher):
-1. Opening Statements, Closing Arguments (95-100) - BEST SOURCE: synthesized key facts, final figures
-2. Claimant/Plaintiff Pre-Hearing Briefs (95-100) - have actual damage figures and evidence tables
-3. Statements of Claim, Amended Claims (90-95) - primary allegations with amounts
-4. Expert Reports from CLAIMANT side (85-90) - damage calculations
-5. Defendant/Respondent briefs (70-80) - arguments but not actual figures
+RULES:
+- Unread documents > already read (unless essential)
+- When BOTH party briefs exist, prioritize both - they contain different information
+- For damages/figures: look for claimant/plaintiff sources
+- Match document type to query type
 
-Consider:
-- Document type as above
-- "Claimant" or "CITIOM" in filename = higher priority for damage queries
-- "Gulfstream" or "Respondent" in filename = lower priority for actual figures
-- Prefer files NOT already read unless clearly essential
-
-Reply with JSON only:
+Reply JSON only:
 {{
     "ranked_files": [
-        {{"file": "path/to/file.pdf", "score": 95, "reason": "brief reason"}},
-        {{"file": "path/to/file2.docx", "score": 72, "reason": "brief reason"}}
+        {{"file": "exact_filename.pdf", "score": 95, "reason": "brief reason"}}
     ]
 }}"""
 
@@ -275,24 +288,31 @@ CRITICAL:
 - Emails and correspondence almost always contain the most relevant case-specific information"""
 
 
-P_ANALYZE_RESULTS = """You are analyzing search results for a legal investigation.
+P_ANALYZE_RESULTS = """Analyze these search results strategically.
 
 Query: {query}
 
 Search Results:
 {results}
 
-Extract the key information:
-1. What facts are directly relevant to the query?
-2. What documents should we read more deeply?
-3. What additional searches might help?
+EXTRACT:
+1. Facts directly answering or advancing the query
+2. Key quotes worth preserving (with source and page)
+3. Documents requiring deeper read (potential goldmines)
+4. Gaps - what's missing that we still need?
 
-Reply in JSON:
+STRATEGIC ASSESSMENT:
+- Are we finding what we need?
+- Should we pivot search strategy?
+- What document types are yielding results vs. dead ends?
+
+Reply JSON:
 {{
-    "facts": ["fact1", "fact2"],
-    "citations": [{{"text": "quote", "source": "filename", "page": 1}}],
-    "read_deeper": ["file1.pdf", "file2.docx"],
-    "additional_searches": ["term1", "term2"]
+    "facts": ["specific fact with exact values"],
+    "citations": [{{"text": "verbatim quote", "source": "filename", "page": 1}}],
+    "read_deeper": ["file1.pdf"],
+    "additional_searches": ["more specific term"],
+    "assessment": "Brief strategic assessment of progress"
 }}"""
 
 
