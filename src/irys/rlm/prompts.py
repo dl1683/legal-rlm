@@ -150,6 +150,47 @@ Reply with JSON only:
 # MID TIER PROMPTS (FLASH model - analysis and planning)
 # =============================================================================
 
+P_ASSESS_SMALL_REPO = """You have ALL documents from this legal matter. Assess the query and determine what's needed.
+
+Query: {query}
+
+=== ALL DOCUMENTS ===
+{content}
+
+=== ASSESSMENT TASK ===
+1. COMPLEXITY: Is the synthesis straightforward or does it require sophisticated legal reasoning?
+2. SUFFICIENCY: Can you answer this query using ONLY these documents?
+
+Apply your external research judgment here. Most queries about case facts, drafting, or
+document-based analysis need no external search. Only recommend external search when the
+query explicitly requires legal authority not present in the documents.
+
+ANSWER FROM DOCS (no external search) when:
+- Query asks about facts, dates, amounts, parties, events in the case
+- Query asks for drafting help using case materials
+- Query asks for summaries or analysis of the documents themselves
+- The documents contain sufficient information to answer
+
+SEARCH EXTERNALLY only when:
+- Query EXPLICITLY asks for case law, precedents, or legal standards
+- Query asks about regulations/statutes NOT referenced in documents
+- You cannot provide a legally supportable answer without external authority
+- The gap is specific and articulable (not just "more context would help")
+
+=== OUTPUT (JSON only) ===
+{{
+  "complexity": "simple" | "complex",
+  "can_answer_from_docs": true | false,
+  "reasoning": "Brief explanation of your assessment",
+  "gap": "Only if can_answer_from_docs=false: what specific external authority is needed and why",
+  "case_law_searches": [],
+  "web_searches": []
+}}
+
+IMPORTANT: If can_answer_from_docs is true, search arrays MUST be empty.
+Only populate searches if there is a genuine, specific gap that external research would fill."""
+
+
 P_CREATE_PLAN = """You are investigating a legal query against a document repository.
 
 Query: {query}
