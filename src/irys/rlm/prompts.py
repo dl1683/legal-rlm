@@ -534,88 +534,65 @@ Reply in JSON:
 }}"""
 
 
-P_GENERATE_EXTERNAL_QUERIES = """You are analyzing case facts to determine if external legal research is needed.
+P_GENERATE_EXTERNAL_QUERIES = """Determine if this query requires external legal research.
 
 Query: {query}
 
-Facts found from documents:
-{facts}
+Facts found: {facts}
 
-Entities identified:
-{entities}
+Entities: {entities}
 
-Research triggers identified from documents:
-{triggers}
+Triggers found in documents: {triggers}
 
-Based on the facts AND the research triggers, generate SPECIFIC external search queries.
+═══════════════════════════════════════════════════════════════════════════════
+FIRST: Does this query actually NEED external research?
+═══════════════════════════════════════════════════════════════════════════════
 
-=== WHEN TO USE EACH SOURCE ===
+DEFAULT: NO EXTERNAL SEARCH. Most queries can be answered from documents alone.
 
-CASE LAW (CourtListener) - Use when:
-- Query involves US legal precedent, judicial interpretations, or standards of proof
-- US jurisdictions are mentioned (e.g., "Michigan", "Delaware", federal courts)
-- Legal doctrines need authority (breach of warranty, negligence, fiduciary duty, etc.)
-- Need to support legal arguments with US case citations
-- LIMITATION: CourtListener is US-focused. DO NOT use for international matters.
+DO NOT SEARCH when query asks about:
+- "What is the main issue/dispute?" → Answer from documents
+- "What happened?" / "Summarize the facts" → Answer from documents
+- "What does the contract say?" → Answer from documents
+- "Who are the parties?" → Answer from documents
+- "What are the claims/allegations?" → Answer from documents
+- Any question about WHAT IS IN THE DOCUMENTS
 
-WEB SEARCH (Tavily) - Use when:
-- Query asks about regulations, statutes, or industry standards
-- User provides a URL/link to look up
-- Need to verify regulatory compliance requirements
-- Triggers include specific regulations (FAA, SEC, OSHA, state codes)
-- International matters - use web for non-US jurisdictions
-- Company/entity research (background, public records, news)
+Just because a document MENTIONS a jurisdiction or regulation does NOT mean
+you need to search for it. Triggers are informational, not commands.
 
-RETURN EMPTY ARRAYS when:
-- That source type is not relevant to this specific query
-- Local documents already have sufficient information
-- No meaningful triggers for that source type
-- The query asks only about case-specific facts (no external authority needed)
+ONLY SEARCH when query EXPLICITLY requires:
+- "What does [jurisdiction] law say about X?" → Search needed
+- "Find case law supporting X" → Search needed
+- "What are the legal standards for X?" → Search needed
+- "Is this compliant with [specific regulation]?" → Search needed
 
-=== HOW TO USE TRIGGERS ===
-- If US jurisdictions found (e.g., "Michigan") → case_law_queries
-- If international jurisdictions found → web_queries (NOT case law)
-- If regulations/statutes found (e.g., "FAA Part 91") → web_queries
-- If US legal doctrines found → case_law_queries
-- If industry standards found → web_queries
-- If specific case references found → case_law_queries (to find those cases)
+═══════════════════════════════════════════════════════════════════════════════
+IF search IS needed, use appropriate source:
+═══════════════════════════════════════════════════════════════════════════════
 
-=== EXAMPLES ===
+CASE LAW (CourtListener) - US only:
+- US legal precedent, judicial interpretations
+- US jurisdictions (Michigan, Delaware, federal)
+- Legal doctrines needing authority
 
-Query about US case law:
-  case_law_queries: ["Michigan breach of warranty aircraft maintenance"]
-  web_queries: []
+WEB SEARCH (Tavily):
+- Regulations, statutes, standards
+- International jurisdictions (NOT CourtListener)
+- Company/entity background research
 
-Query about regulations:
-  case_law_queries: []
-  web_queries: ["FAA Part 91 inspection requirements"]
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════════════════════════════
 
-Query about international matter (e.g., UK, EU):
-  case_law_queries: []
-  web_queries: ["UK aviation maintenance regulations", "EASA inspection standards"]
-
-Query needing both (US legal + regulatory):
-  case_law_queries: ["Delaware fiduciary duty directors"]
-  web_queries: ["SEC disclosure requirements public companies"]
-
-Query about case facts only:
-  case_law_queries: []
-  web_queries: []
-  reasoning: "Query asks only about facts in documents, no external authority needed"
-
-Reply in JSON only:
-{{
-    "case_law_queries": ["specific query 1", "specific query 2"],
-    "web_queries": ["specific regulation/standard query"],
-    "reasoning": "Brief explanation of source selection and which triggers informed searches"
-}}
-
-If no external research is needed, reply:
+Reply JSON:
 {{
     "case_law_queries": [],
     "web_queries": [],
-    "reasoning": "Reason why external research not needed"
-}}"""
+    "reasoning": "Why search is or is not needed for THIS SPECIFIC QUERY"
+}}
+
+If the query is about document facts/issues/parties/claims, return empty arrays."""
 
 
 P_EXTRACT_TRIGGERS = """Scan this legal document content and identify any external research triggers.
