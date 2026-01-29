@@ -507,6 +507,7 @@ async def assess_small_repo(
     query: str,
     content: str,
     client: GeminiClient,
+    max_content_chars: int = 25000,
 ) -> dict:
     """Unified assessment for small repositories.
 
@@ -517,14 +518,27 @@ async def assess_small_repo(
     Uses FLASH model for better judgment on external search decisions.
     The FLASH system prompt already includes guidance on being selective
     about external research.
+
+    Note: Content is truncated to max_content_chars for assessment efficiency.
+    The full content is still used for synthesis - this is just for the
+    complexity/external search decision.
     """
     start_time = time.time()
-    content_preview = f"{len(content):,} chars"
+
+    # Truncate content for assessment - we don't need all content to decide
+    # if external search is needed, just a representative sample
+    if len(content) > max_content_chars:
+        truncated_content = content[:max_content_chars] + f"\n\n[... truncated, {len(content):,} total chars ...]"
+        logger.info(f"📊 assess_small_repo: truncated {len(content):,} chars to {max_content_chars:,} for assessment")
+    else:
+        truncated_content = content
+
+    content_preview = f"{len(truncated_content):,} chars (of {len(content):,} total)"
     logger.info(f"📊 assess_small_repo: evaluating query against {content_preview}")
 
     prompt = prompts.P_ASSESS_SMALL_REPO.format(
         query=query,
-        content=content,
+        content=truncated_content,
     )
 
     _log_llm_call("assess_small_repo", ModelTier.FLASH, prompt, start_time)
