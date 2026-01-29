@@ -528,7 +528,8 @@ async def assess_small_repo(
     )
 
     _log_llm_call("assess_small_repo", ModelTier.FLASH, prompt, start_time)
-    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    # No timeout - let the model take as long as needed for full document assessment
+    response = await client.complete(prompt, tier=ModelTier.FLASH, timeout=0)
     result = parse_json_safe(response)
 
     if result:

@@ -315,7 +315,9 @@ class GeminiClient:
         """
         mc = MODEL_CONFIGS[tier]
         config = self._get_config(tier, system_prompt)  # Pass system_prompt to config
-        request_timeout = timeout or self.timeout
+        # timeout=0 means no timeout, None uses default
+        request_timeout = timeout if timeout is not None else self.timeout
+        no_timeout = (request_timeout == 0)
 
         # Build cache key (only cache if no tools and cache enabled)
         cache_enabled = use_cache and self._cache and not tools
@@ -352,15 +354,16 @@ class GeminiClient:
 
         for attempt in range(max_attempts):
             try:
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.client.models.generate_content,
-                        model=model_to_use,
-                        contents=contents,
-                        config=config,
-                    ),
-                    timeout=request_timeout,
+                api_call = asyncio.to_thread(
+                    self.client.models.generate_content,
+                    model=model_to_use,
+                    contents=contents,
+                    config=config,
                 )
+                if no_timeout:
+                    response = await api_call
+                else:
+                    response = await asyncio.wait_for(api_call, timeout=request_timeout)
                 break  # Success
             except asyncio.TimeoutError:
                 logger.error(f"API call to {model_to_use} timed out after {request_timeout}s")
@@ -379,15 +382,16 @@ class GeminiClient:
                         model_to_use = mc.fallback_model_id
                         # One more attempt with fallback
                         try:
-                            response = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    self.client.models.generate_content,
-                                    model=model_to_use,
-                                    contents=contents,
-                                    config=config,
-                                ),
-                                timeout=request_timeout,
+                            fallback_call = asyncio.to_thread(
+                                self.client.models.generate_content,
+                                model=model_to_use,
+                                contents=contents,
+                                config=config,
                             )
+                            if no_timeout:
+                                response = await fallback_call
+                            else:
+                                response = await asyncio.wait_for(fallback_call, timeout=request_timeout)
                             break  # Fallback succeeded
                         except Exception as fallback_error:
                             raise fallback_error
