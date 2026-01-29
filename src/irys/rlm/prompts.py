@@ -545,41 +545,43 @@ Entities: {entities}
 Triggers found in documents: {triggers}
 
 ═══════════════════════════════════════════════════════════════════════════════
-FIRST: Does this query actually NEED external research?
+DECISION FRAMEWORK
 ═══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT: NO EXTERNAL SEARCH. Most queries can be answered from documents alone.
+READ THE QUERY CAREFULLY. What is being asked?
 
-DO NOT SEARCH when query asks about:
-- "What is the main issue/dispute?" → Answer from documents
-- "What happened?" / "Summarize the facts" → Answer from documents
+YES - SEARCH EXTERNALLY when query asks for:
+- "What cases should we study?" / "Find relevant precedents" → CASE LAW SEARCH
+- "What does the law say about X?" → CASE LAW or WEB SEARCH
+- "What are the legal standards for X?" → CASE LAW SEARCH
+- "Is this compliant with [regulation]?" → WEB SEARCH
+- Legal analysis requiring authority beyond the documents
+- Research on specific legal doctrines mentioned in documents
+
+NO - DON'T SEARCH when query asks about:
+- "What is the main issue?" → Answer from documents
+- "What happened?" / "Summarize facts" → Answer from documents
 - "What does the contract say?" → Answer from documents
 - "Who are the parties?" → Answer from documents
-- "What are the claims/allegations?" → Answer from documents
-- Any question about WHAT IS IN THE DOCUMENTS
+- Pure document-based questions with no legal research component
 
-Just because a document MENTIONS a jurisdiction or regulation does NOT mean
-you need to search for it. Triggers are informational, not commands.
-
-ONLY SEARCH when query EXPLICITLY requires:
-- "What does [jurisdiction] law say about X?" → Search needed
-- "Find case law supporting X" → Search needed
-- "What are the legal standards for X?" → Search needed
-- "Is this compliant with [specific regulation]?" → Search needed
+KEY INSIGHT: Triggers (jurisdictions, doctrines found in docs) are CLUES, not commands.
+- If query asks for CASE LAW and triggers mention Delaware → Search Delaware case law
+- If query asks "what's the issue" and triggers mention Delaware → DON'T search
 
 ═══════════════════════════════════════════════════════════════════════════════
-IF search IS needed, use appropriate source:
+SOURCES
 ═══════════════════════════════════════════════════════════════════════════════
 
-CASE LAW (CourtListener) - US only:
-- US legal precedent, judicial interpretations
-- US jurisdictions (Michigan, Delaware, federal)
-- Legal doctrines needing authority
+CASE LAW (CourtListener) - US jurisdictions only:
+- Delaware corporate/LLC law (very common for entity matters)
+- Federal courts, state courts
+- Legal doctrine precedents
 
 WEB SEARCH (Tavily):
+- International jurisdictions (Marshall Islands, UK, etc.)
 - Regulations, statutes, standards
-- International jurisdictions (NOT CourtListener)
-- Company/entity background research
+- Company background research
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT
@@ -587,12 +589,10 @@ OUTPUT
 
 Reply JSON:
 {{
-    "case_law_queries": [],
-    "web_queries": [],
-    "reasoning": "Why search is or is not needed for THIS SPECIFIC QUERY"
-}}
-
-If the query is about document facts/issues/parties/claims, return empty arrays."""
+    "case_law_queries": ["specific query if case law needed"],
+    "web_queries": ["specific query if web search needed"],
+    "reasoning": "Why search is or is not needed based on WHAT THE QUERY ASKS"
+}}"""
 
 
 P_EXTRACT_TRIGGERS = """Scan this legal document content and identify any external research triggers.
