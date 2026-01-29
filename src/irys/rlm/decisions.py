@@ -503,6 +503,110 @@ async def decide_next_action(
 # MID TIER DECISIONS (FLASH model)
 # =============================================================================
 
+async def assess_small_repo(
+    query: str,
+    content: str,
+    client: GeminiClient,
+) -> dict:
+    """Unified assessment for small repositories.
+
+    Determines:
+    1. Query complexity (simple vs complex) for synthesis tier selection
+    2. Whether external search is needed (with specific searches if so)
+
+    Uses FLASH model for better judgment on external search decisions.
+    The FLASH system prompt already includes guidance on being selective
+    about external research.
+    """
+    start_time = time.time()
+    content_preview = f"{len(content):,} chars"
+    logger.info(f"📊 assess_small_repo: evaluating query against {content_preview}")
+
+    prompt = prompts.P_ASSESS_SMALL_REPO.format(
+        query=query,
+        content=content,
+    )
+
+    _log_llm_call("assess_small_repo", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        # Filter out template-style external queries if any were generated
+        if "case_law_searches" in result:
+            result["case_law_searches"] = filter_external_queries(result.get("case_law_searches", []))
+        if "web_searches" in result:
+            result["web_searches"] = filter_external_queries(result.get("web_searches", []))
+
+        # Ensure consistency: if can_answer_from_docs is True, searches must be empty
+        if result.get("can_answer_from_docs", True):
+            result["case_law_searches"] = []
+            result["web_searches"] = []
+
+        complexity = result.get("complexity", "complex")
+        can_answer = result.get("can_answer_from_docs", True)
+        searches = len(result.get("case_law_searches", [])) + len(result.get("web_searches", []))
+        logger.info(f"   Assessment: complexity={complexity}, can_answer_from_docs={can_answer}, searches={searches}")
+        _log_llm_result("assess_small_repo", result, time.time() - start_time)
+        return result
+
+    # Fallback: assume complex, can answer from docs (conservative - no external search)
+    logger.warning("   JSON parsing failed, using conservative fallback (no external search)")
+    return {
+        "complexity": "complex",
+        "can_answer_from_docs": True,
+        "reasoning": "Fallback assessment",
+        "gap": "",
+        "case_law_searches": [],
+        "web_searches": [],
+    }
+
+
+async def check_search_sufficiency(
+    query: str,
+    original_gap: str,
+    results_summary: str,
+    client: GeminiClient,
+) -> dict:
+    """Check if external search results are sufficient or if more search is needed.
+
+    Uses FLASH model to evaluate whether the search results fill the identified gap.
+    Only recommends additional search if there's a critical missing piece.
+    """
+    start_time = time.time()
+    logger.info(f"🔍 check_search_sufficiency: evaluating search results against gap")
+
+    prompt = prompts.P_CHECK_SEARCH_SUFFICIENCY.format(
+        query=query,
+        original_gap=original_gap,
+        results_summary=results_summary,
+    )
+
+    _log_llm_call("check_search_sufficiency", ModelTier.FLASH, prompt, start_time)
+    response = await client.complete(prompt, tier=ModelTier.FLASH)
+    result = parse_json_safe(response)
+
+    if result:
+        # Filter additional search if present
+        if "additional_search" in result and result["additional_search"]:
+            filtered = filter_external_queries([result["additional_search"]])
+            result["additional_search"] = filtered[0] if filtered else ""
+
+        sufficient = result.get("sufficient", True)
+        logger.info(f"   Sufficiency: {sufficient}")
+        _log_llm_result("check_search_sufficiency", result, time.time() - start_time)
+        return result
+
+    # Fallback: assume sufficient (conservative - no more searching)
+    logger.warning("   JSON parsing failed, assuming sufficient")
+    return {
+        "sufficient": True,
+        "reasoning": "Fallback - proceeding with available results",
+        "if_not_sufficient_what_missing": "",
+        "additional_search": "",
+    }
+
+
 async def create_plan(
     query: str,
     file_list: str,
