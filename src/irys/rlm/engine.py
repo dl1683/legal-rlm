@@ -1270,9 +1270,9 @@ class RLMEngine:
         # SOURCE 1: Local document evidence
         facts = state.findings.get("accumulated_facts", [])
         evidence = "\n".join(f"- {fact}" for fact in facts[:20])
-        citations = state.get_citations_formatted()
+        # Note: Citations tracked in state for UI/downstream, not passed to synthesis
 
-        # SOURCE 4: Pinned content - either from small repo (all docs) or DECISIVE docs
+        # SOURCE 2: Pinned content - either from small repo (all docs) or DECISIVE docs
         small_repo_content = state.findings.get("small_repo_content")
         if small_repo_content:
             # Small repo mode - all content already loaded
@@ -1282,7 +1282,7 @@ class RLMEngine:
             # Large repo mode - load DECISIVE pinned documents
             pinned_content = await self._load_pinned_documents(state)
 
-        # SOURCES 2 & 3: External research (case law + web)
+        # SOURCE 3: External research (case law + web)
         external_formatted = self._format_external_research()
         case_law_text = external_formatted.get("case_law", "No case law found")
         web_text = external_formatted.get("web", "No web results found")
@@ -1294,17 +1294,16 @@ class RLMEngine:
         state.findings["sources_used"] = sources_used
 
         # Choose tier: FLASH for simple queries, PRO for complex
-        # NOTE: Only the model changes - prompt, max_tokens, system prompt stay the same
+        # FLASH model + PRO system prompt for simple synthesis
         from irys.core.models import ModelTier
         synthesis_tier = ModelTier.FLASH if (is_simple and self.config.use_flash_for_simple) else ModelTier.PRO
         if synthesis_tier == ModelTier.FLASH:
-            logger.info("Using FLASH model for simple query synthesis (same params as PRO)")
+            logger.info("Using FLASH model with PRO system prompt for simple query synthesis")
 
-        # Full synthesis with all four sources clearly separated
+        # Synthesize with materials only - PRO system prompt handles the rest
         response = await decisions.synthesize(
             query=state.query,
-            evidence=evidence or "No specific findings accumulated",
-            citations=citations or "No citations collected",
+            evidence=evidence,
             external_research=f"=== CASE LAW (CourtListener) ===\n{case_law_text}\n\n=== REGULATIONS/STANDARDS (Web) ===\n{web_text}",
             pinned_content=pinned_content,
             client=self.client,

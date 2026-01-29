@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Optional, Any
 
-from ..core.models import GeminiClient, ModelTier
+from ..core.models import GeminiClient, ModelTier, SYSTEM_PROMPT_PRO
 from ..core.search import SearchHit, SearchResults
 from . import prompts
 
@@ -757,16 +757,15 @@ async def replan(
 async def synthesize(
     query: str,
     evidence: str,
-    citations: str,
     client: GeminiClient,
     external_research: str = "",
     pinned_content: str = "",
-    tier: ModelTier = ModelTier.PRO,  # Can use FLASH for simple queries - only model changes
+    tier: ModelTier = ModelTier.PRO,
 ) -> str:
     """Synthesize final answer.
 
-    Uses PRO model by default. For simple queries, can use FLASH tier but
-    all other parameters (prompt, max_tokens, system prompt) stay the same.
+    Uses PRO model by default. For simple queries, can use FLASH model
+    but ALWAYS uses PRO system prompt for synthesis quality.
     """
     start_time = time.time()
     evidence_lines = evidence.count('\n') + 1 if evidence else 0
@@ -776,45 +775,17 @@ async def synthesize(
 
     prompt = prompts.P_SYNTHESIZE.format(
         query=query,
-        evidence=evidence,
+        evidence=evidence or "No specific findings accumulated.",
         external_research=external_research or "No external research conducted.",
-        citations=citations,
         pinned_content=pinned_content or "No decisive documents identified.",
     )
 
     _log_llm_call("synthesize", tier, prompt, start_time)
-    response = await client.complete(prompt, tier=tier)
+    # ALWAYS use PRO system prompt for synthesis, regardless of model tier
+    response = await client.complete(prompt, tier=tier, system_prompt=SYSTEM_PROMPT_PRO)
 
     logger.info(f"✨ Synthesis complete: {len(response)} chars")
     _log_llm_result("synthesize", f"{len(response)} char response", time.time() - start_time)
-    return response
-
-
-async def synthesize_simple(
-    query: str,
-    evidence: str,
-    citations: str,
-    client: GeminiClient,
-    pinned_content: str = "",
-) -> str:
-    """Synthesize simple factual answer. Uses FLASH model for speed."""
-    start_time = time.time()
-    evidence_lines = evidence.count('\n') + 1 if evidence else 0
-    pinned_info = f", {len(pinned_content)} chars pinned" if pinned_content else ""
-    logger.info(f"📝 synthesize_simple: quick answer from {evidence_lines} evidence lines{pinned_info} [FLASH]")
-
-    prompt = prompts.P_SYNTHESIZE_SIMPLE.format(
-        query=query,
-        evidence=evidence,
-        citations=citations,
-        pinned_content=pinned_content or "",
-    )
-
-    _log_llm_call("synthesize_simple", ModelTier.FLASH, prompt, start_time)
-    response = await client.complete(prompt, tier=ModelTier.FLASH)
-
-    logger.info(f"✨ Simple synthesis complete: {len(response)} chars")
-    _log_llm_result("synthesize_simple", f"{len(response)} char response", time.time() - start_time)
     return response
 
 

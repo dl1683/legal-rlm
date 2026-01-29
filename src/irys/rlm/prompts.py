@@ -378,53 +378,17 @@ Reply in JSON:
 # HIGH TIER PROMPTS (PRO model - final synthesis)
 # =============================================================================
 
-P_SYNTHESIZE = """You are a senior legal analyst preparing a response to a query.
+P_SYNTHESIZE = """Query: {query}
 
-Query: {query}
-
-=== DECISIVE DOCUMENTS (Full Content) ===
+=== DECISIVE DOCUMENTS ===
 {pinned_content}
 
-=== CASE-SPECIFIC EVIDENCE ===
+=== EVIDENCE GATHERED ===
 {evidence}
 
-=== EXTERNAL LEGAL RESEARCH ===
+=== EXTERNAL RESEARCH ===
 {external_research}
-
-=== CITATIONS ===
-{citations}
-
-IMPORTANT: PRIORITIZE information from the DECISIVE DOCUMENTS section - these are the most critical sources for answering this query. They have been identified as directly relevant and their full content is provided above.
-
-Write a clear, well-organized response that:
-1. Directly answers the query, prioritizing DECISIVE document content
-2. Supports legal conclusions with relevant case law and regulations when available
-3. Cites specific sources for each claim (both case documents AND external sources)
-4. Distinguishes between case facts and general legal principles
-5. Notes any gaps or uncertainties
-6. Is appropriate in length for the complexity of the question
-
-When citing:
-- Case documents: [Document Name, p. X]
-- Case law: [Case Name, Citation]
-- Regulations/Web: [Source Name]
-
-Format your response with clear sections if the answer is complex."""
-
-
-P_SYNTHESIZE_SIMPLE = """Answer this factual question concisely based on the evidence.
-
-Query: {query}
-{pinned_content}
-Evidence:
-{evidence}
-
-Sources:
-{citations}
-
-Provide a brief, direct answer (2-4 sentences). Include the key facts and cite sources.
-If DECISIVE document content is provided above, prioritize that information.
-Do not elaborate unnecessarily - just answer the question directly."""
+"""
 
 
 P_RESOLVE_CONTRADICTIONS = """You are analyzing potentially contradictory evidence.
