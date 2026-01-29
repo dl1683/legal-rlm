@@ -658,46 +658,52 @@ Reply in JSON:
 }}"""
 
 
-P_ANALYZE_SEARCH = """You are analyzing search results for a legal investigation.
+P_ANALYZE_SEARCH = """Analyze search results for this investigation.
 
 Query: {query}
 
-Key issues identified:
-{key_issues}
+Key issues: {key_issues}
 
 Search Results:
 {results}
 
-Already read documents:
-{already_read}
+Already read: {already_read}
 
-Perform a COMPLETE analysis in ONE pass:
+═══════════════════════════════════════════════════════════════════════════════
+DOCUMENT CRITICALITY - BE STRATEGIC WITH MEMORY
+═══════════════════════════════════════════════════════════════════════════════
 
-1. RELEVANT HITS: Which search results are most relevant? (by number)
-2. KEY FACTS: What facts are directly relevant to the query?
-3. DOCUMENT PRIORITY: Rank candidate documents for deeper reading.
-   - Score 0-100 for relevance
-   - CRITICAL: Pleadings, correspondence, party briefs > reference materials
-   - Prioritize unread documents
-4. ADDITIONAL NEEDS: What else might help?
+DECISIVE (gets loaded in full for synthesis):
+- ONLY case-specific documents that DIRECTLY answer the query
+- Contracts, agreements specific to this matter
+- Party correspondence, emails about the dispute
+- Pleadings, briefs, statements specific to this case
+- Expert reports specific to this matter
 
-DOCUMENT CRITICALITY:
-- Mark any document as "DECISIVE" if it appears to directly answer the query
-- Mark as "IRRELEVANT" if clearly not useful for this specific query
-- Mark as "SUPPORTING" for useful context
+NEVER DECISIVE (always SUPPORTING or IRRELEVANT):
+- Statutes, acts, codes (e.g., "Business Corporations Act")
+- Generic regulations or legal references
+- Manuals, handbooks, guidelines
+- Template documents
+- Background/reference materials
 
-Reply in JSON:
+SUPPORTING: Useful context but don't need full content in synthesis
+IRRELEVANT: Not useful for this query - skip
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Reply JSON:
 {{
     "relevant_hit_numbers": [1, 3, 5],
-    "facts": ["fact1 with exact values", "fact2"],
+    "facts": ["fact with exact values"],
     "citations": [{{"text": "quote", "source": "filename", "page": 1}}],
     "ranked_documents": [
-        {{"file": "path/file.pdf", "score": 95, "criticality": "DECISIVE", "reason": "brief reason"}},
-        {{"file": "path/file2.pdf", "score": 70, "criticality": "SUPPORTING", "reason": "brief reason"}},
-        {{"file": "path/file3.pdf", "score": 10, "criticality": "IRRELEVANT", "reason": "brief reason"}}
+        {{"file": "path/file.pdf", "score": 95, "criticality": "DECISIVE", "reason": "case-specific, answers query"}},
+        {{"file": "statute.pdf", "score": 40, "criticality": "SUPPORTING", "reason": "reference material only"}}
     ],
-    "additional_searches": ["term1"],
-    "read_deeper": ["file1.pdf"]
+    "additional_searches": ["term"],
+    "read_deeper": ["file.pdf"],
+    "assessment": "Brief strategic assessment"
 }}"""
 
 
