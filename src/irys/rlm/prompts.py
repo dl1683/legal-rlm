@@ -191,6 +191,36 @@ IMPORTANT: If can_answer_from_docs is true, search arrays MUST be empty.
 Only populate searches if there is a genuine, specific gap that external research would fill."""
 
 
+P_CHECK_SEARCH_SUFFICIENCY = """You searched for external legal authority and found these results.
+
+Query: {query}
+
+=== ORIGINAL GAP ===
+{original_gap}
+
+=== SEARCH RESULTS ===
+{results_summary}
+
+=== QUESTION ===
+Do these results adequately fill the gap, or is there still a CRITICAL missing piece?
+
+CRITICAL means: Your answer would be WRONG or MISLEADING without this information.
+NOT critical: "More would be nice" or "additional context could help"
+
+Default: The results are sufficient. Proceed to synthesis.
+
+=== OUTPUT (JSON only) ===
+{{
+  "sufficient": true | false,
+  "reasoning": "Brief explanation",
+  "if_not_sufficient_what_missing": "Only if sufficient=false: specific critical gap remaining",
+  "additional_search": ""
+}}
+
+IMPORTANT: Only set sufficient=false if you have a specific, critical piece of information
+that is absolutely required. If you got relevant results, proceed with what you have."""
+
+
 P_CREATE_PLAN = """You are investigating a legal query against a document repository.
 
 Query: {query}
